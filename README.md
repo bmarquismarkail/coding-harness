@@ -1,4 +1,19 @@
-# Local LangGraph coding agent
+# Local LangGraph coding agent — v0.2
+
+The v0.2 coding service adds durable jobs, isolated edits, Bubblewrap execution,
+source-bound checks, SQLite LangGraph resume, and shared CLI/Python/MCP interfaces.
+See **[the v0.2 guide](docs/v0.2.md)** for setup, commands, profiles, isolation,
+verification rules, and live acceptance. The source checkout stays intact;
+results return patches for review. A completed workflow can remain unverified.
+
+Quick start with the existing environment and `LLAMA_API_KEY`:
+
+```bash
+/home/user/python-venv/langchain-suite/bin/python -m coding_agent.cli run \
+  --wait --root /path/to/project --checks acceptance-checks.json 'Repair the bug'
+```
+
+The following sections document the preserved **legacy read-only interface**.
 
 This repository contains a configurable coding-agent graph for OpenAI-compatible llama-server instances. It uses one lead model at `https://lead.example.invalid/v1` and a separate subagent model at `https://specialist.example.invalid/v1`. The default graph launches nine specialist branches in parallel, then asks the lead model to reconcile their evidence.
 
@@ -37,7 +52,7 @@ context -> lead plan -> Send(specialist x 9) -> lead synthesis
 
 Repository context is bounded and read-only. It includes important project files and common source/configuration extensions while excluding VCS metadata, virtual environments, build outputs, caches, symlinks, and hidden directories. Model responses are parsed as JSON when possible, but malformed responses are retained as text instead of being treated as successful structured output.
 
-The current implementation is intentionally a planning/evidence handoff agent. It does not execute arbitrary model-generated shell commands or edit files. That keeps the provider boundary safe and makes the graph testable without network access. A later tool broker can add typed, allow-listed operations such as exact search, read-file ranges, compiler checks, and sandboxed tests.
+The legacy interface remains a planning/evidence handoff agent. It does not execute project commands or edit files. The v0.2 service provides editing and execution through a separate validated tool broker and isolated workspaces.
 
 ## zvec-grep tool
 

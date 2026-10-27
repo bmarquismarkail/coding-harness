@@ -30,8 +30,10 @@ def _url(value: str, field_name: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ConfigError(
-            f"{field_name} must be an absolute http(s) URL, including the scheme: {value!r}"
+            f"{field_name} must be an absolute http(s) URL, including the scheme"
         )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ConfigError(f"{field_name} must not contain credentials, query parameters, or fragments")
     if not parsed.path or parsed.path == "/":
         value += "/v1"
     return value

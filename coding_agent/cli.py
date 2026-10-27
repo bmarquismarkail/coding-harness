@@ -9,7 +9,7 @@ from .graph import run_agent
 from .zvec import ZvecGrepError, ZvecGrepSettings, ZvecGrepTool
 
 
-def main(argv: list[str] | None = None) -> int:
+def legacy_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the configurable LangGraph coding agent")
     parser.add_argument("task", nargs="?", help="coding task for the agent")
     parser.add_argument("--root", default=".", help="repository root to inspect")
@@ -89,6 +89,15 @@ def main(argv: list[str] | None = None) -> int:
         "synthesis": result.get("synthesis", {}),
     }, indent=2))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    from .batch_cli import main as batch_main
+    args = sys.argv[1:] if argv is None else argv
+    commands = {"run", "submit", "status", "events", "result", "resume", "cancel", "list-runs", "artifact", "serve-mcp"}
+    if args and (args[0] in commands or args[0] in {"-h", "--help"}):
+        return batch_main(args)
+    return legacy_main(args)
 
 
 if __name__ == "__main__":
