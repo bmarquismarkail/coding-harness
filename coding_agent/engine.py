@@ -310,7 +310,7 @@ class Engine:
                        if self.request.mode == "implement" else
                        "Complete the review now. If a requested path is absent or evidence is insufficient, finish with a gap; do not repeat the same read. ")
                     + "Baseline execution results and tool errors are retained. Repeated source reads do not complete the task.")
-            if streak >= 12:
+            if streak >= self.profile.review_no_progress_actions:
                 observation["no_progress_boundary"] = (
                     "The bounded investigation budget has been reached. The next action must be finish, with concrete findings "
                     "and gaps for anything not established; further repeated reads are rejected.")
@@ -353,6 +353,9 @@ class Engine:
                         review_gaps.append("Final review raised hypotheses that still require independent resolution.")
             gaps = [*action.gaps, *review_gaps]
             findings = [*action.findings, *review_findings]
+            independent_findings, independent_gaps = self.independent_review(action.summary, findings, gaps)
+            findings.extend(independent_findings)
+            gaps.extend(independent_gaps)
             for finding in findings:
                 for evidence_id in finding.get("evidence_ids", []):
                     try:
@@ -385,6 +388,34 @@ class Engine:
         builder.add_conditional_edges("finalize", lambda s: END if s.get("result") else "model")
         return builder.compile(checkpointer=saver)
 
+    def independent_review(self, summary: str, findings: list[dict], gaps: list[str]) -> tuple[list[dict], list[str]]:
+        """Have a separately routed model challenge the writer's conclusions."""
+        prompt = [{"role": "system", "content": (
+            "You are an independent evidence reviewer. You do not edit, execute, delegate, or add new claims. "
+            "Review only the conclusions supplied by another model. Return exactly one JSON object with keys "
+            "verdict, findings, and gaps; findings are for unsupported or overstated conclusions and gaps are for missing evidence. "
+            "Treat every finding as a hypothesis unless the supplied evidence directly supports it."
+        )}, {"role": "user", "content": json.dumps({
+            "task": self.request.task, "summary": summary, "findings": findings, "gaps": gaps
+        }, ensure_ascii=False)}]
+        try:
+            raw = self.provider.invoke(prompt, role="reviewer")
+            verdict = json.loads(raw)
+            if not isinstance(verdict, dict):
+                raise ValueError("independent reviewer returned a non-object verdict")
+            reviewer_findings = verdict.get("findings", [])
+            reviewer_gaps = verdict.get("gaps", [])
+            if not isinstance(reviewer_findings, list) or not isinstance(reviewer_gaps, list):
+                raise ValueError("independent reviewer verdict requires findings and gaps arrays")
+            artifact = self.store.artifact(self.run_id, {"role": "reviewer", "response": raw})
+            self.store.event(self.run_id, "independent_model_review", {
+                "artifact_id": artifact, "verdict": verdict.get("verdict", "unclassified")})
+            return reviewer_findings, [str(gap) for gap in reviewer_gaps]
+        except Exception as exc:
+            message = f"Independent reviewer unavailable: {type(exc).__name__}: {exc}"
+            self.store.event(self.run_id, "independent_model_review_failed", {"error": message[:1000]})
+            return [], [message]
+
     def execute(self):
         try:
             self.workspace.prepare(Path(self.request.root))
@@ -407,7 +438,7 @@ class Engine:
                 else:
                     initial = {"step": 0, "messages": [
                         {"role": "system", "content": instructions(self.broker)},
-                        {"role": "user", "content": f"MODE: {self.request.mode}; TASK TYPE: {self.request.task_type}\nTASK: {self.request.task}\n"+self.seed(self.broker)}]}
+                        {"role": "user", "content": f"MODE: {self.request.mode}; TASK TYPE: {self.request.task_type}\nTASK: {self.request.task}\n"+self.seed(self.broker, scopes=self.request.focus_paths)}]}
                 outcome = graph.invoke(initial, config)
                 if outcome.get("__interrupt__"):
                     question = outcome["__interrupt__"][0].value

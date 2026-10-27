@@ -127,6 +127,7 @@ class ZvecSettings:
 class AgentConfig:
     main: ModelSettings
     subagents: ModelSettings
+    reviewer: ModelSettings
     parallelism: int = 9
     json_mode: bool = True
     context: ContextSettings = field(default_factory=ContextSettings)
@@ -146,15 +147,30 @@ class AgentConfig:
             )
         if any(not role for role in roles):
             raise ConfigError("specialist_roles cannot contain empty values")
+        reviewer_data = dict(data.get("reviewer", {}))
+        reviewer_data.setdefault("base_url", "https://api.openai.com/v1")
+        reviewer_data.setdefault("model", "gpt-4.1-mini")
+        reviewer_data.setdefault("api_key_env", "OPENAI_API_KEY")
         return cls(
             main=ModelSettings.from_mapping(data.get("main", {}), "main"),
             subagents=ModelSettings.from_mapping(sub_data, "subagents"),
+            reviewer=ModelSettings.from_mapping(reviewer_data, "reviewer"),
             parallelism=parallelism,
             json_mode=bool(data.get("json_mode", True)),
             context=ContextSettings.from_mapping(data.get("context", {})),
             zvec=ZvecSettings.from_mapping(data.get("zvec", {})),
             specialist_roles=roles,
         )
+
+    @staticmethod
+    def _endpoint(value: str) -> str:
+        return value.rstrip("/").lower()
+
+    def __post_init__(self):
+        endpoints = {self._endpoint(self.main.base_url), self._endpoint(self.subagents.base_url),
+                     self._endpoint(self.reviewer.base_url)}
+        if len(endpoints) != 3:
+            raise ConfigError("main, subagents, and reviewer must use different endpoints")
 
     def with_environment(self, environ: Mapping[str, str] | None = None) -> "AgentConfig":
         """Apply explicit, non-secret overrides without changing credential selection."""
@@ -180,6 +196,16 @@ class AgentConfig:
                 "max_tokens": self.subagents.max_tokens,
                 "reasoning_effort": self.subagents.reasoning_effort,
                 "enable_thinking": self.subagents.enable_thinking,
+            },
+            "reviewer": {
+                "base_url": env.get("REVIEWER_BASE_URL", self.reviewer.base_url),
+                "model": env.get("REVIEWER_MODEL", self.reviewer.model),
+                "api_key_env": env.get("REVIEWER_API_KEY_ENV", self.reviewer.api_key_env),
+                "timeout_seconds": self.reviewer.timeout_seconds,
+                "temperature": self.reviewer.temperature,
+                "max_tokens": self.reviewer.max_tokens,
+                "reasoning_effort": self.reviewer.reasoning_effort,
+                "enable_thinking": self.reviewer.enable_thinking,
             },
             "json_mode": self.json_mode,
             "context": {
@@ -211,6 +237,13 @@ def _defaults() -> dict[str, Any]:
             "model": "XHToken/Spark-X2.6-4B",
             "api_key_env": "LLAMA_API_KEY",
             "parallelism": 9,
+            "reasoning_effort": "none",
+            "enable_thinking": False,
+        },
+        "reviewer": {
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4.1-mini",
+            "api_key_env": "OPENAI_API_KEY",
             "reasoning_effort": "none",
             "enable_thinking": False,
         },

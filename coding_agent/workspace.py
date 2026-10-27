@@ -18,7 +18,7 @@ OUTPUT_SUFFIXES = {".pyc", ".o", ".a", ".so", ".dll", ".exe", ".class"}
 
 def excluded(relative: str) -> bool:
     p = Path(relative)
-    return (any(part in EXCLUDED_DIRS or part.startswith("build-") for part in p.parts)
+    return (any(part in EXCLUDED_DIRS or part.startswith(("build-", ".venv-", "venv-")) for part in p.parts)
             or p.name in SECRET_NAMES or p.name.startswith(".env.") and p.name != ".env.example"
             or p.suffix in {".pem", ".key"} or p.suffix in OUTPUT_SUFFIXES)
 

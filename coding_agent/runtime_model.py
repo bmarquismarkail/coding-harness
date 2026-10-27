@@ -17,15 +17,18 @@ class RecordingProvider:
 
     def invoke(self, messages, *, role):
         self.store.consume(self.run_id, kind="model")
-        settings = self.config.main if role == "main" else self.config.subagents
+        settings = {"main": self.config.main, "subagent": self.config.subagents,
+                    "reviewer": self.config.reviewer}.get(role)
+        if settings is None:
+            raise ModelError(f"unknown model role: {role}")
         request = {"role": role, "model": settings.model, "base_url": settings.base_url,
                    "max_tokens": settings.max_tokens, "enable_thinking": settings.enable_thinking,
-                   "messages": messages, "response_format": self.response_format()}
+                   "messages": messages, "response_format": self.response_format(role)}
         artifact = self.store.artifact(self.run_id, request)
         self.store.event(self.run_id, "model_started", {"role": role, "request_artifact": artifact})
         started = time.monotonic()
         try:
-            body = asyncio.run(self._request(settings, messages))
+            body = asyncio.run(self._request(settings, messages, role))
             record = {"request_artifact": artifact, "response": body, "http_status": 200,
                       "elapsed_seconds": round(time.monotonic()-started, 3)}
             result_id = self.store.artifact(self.run_id, record)
@@ -40,7 +43,7 @@ class RecordingProvider:
             return content
         except Exception as exc:
             message = str(exc)
-            for key in ("LLAMA_API_KEY", "HARNESS_MCP_API_KEY"):
+            for key in ("LLAMA_API_KEY", "OPENAI_API_KEY", "HARNESS_MCP_API_KEY"):
                 if os.environ.get(key):
                     message = message.replace(os.environ[key], "[redacted]")
             self.store.event(self.run_id, "model_failed", {"role": role, "error": message, "request_artifact": artifact})
@@ -48,7 +51,7 @@ class RecordingProvider:
                 raise InterruptedError(message) from None
             raise ModelError(message) from None
 
-    async def _request(self, settings, messages):
+    async def _request(self, settings, messages, role="main"):
         headers = {}
         if settings.api_key_env:
             key = os.environ.get(settings.api_key_env)
@@ -56,10 +59,10 @@ class RecordingProvider:
                 raise ModelError(f"required credential environment variable {settings.api_key_env} is missing")
             headers["Authorization"] = f"Bearer {key}"
         payload = {"model": settings.model, "messages": messages, "temperature": settings.temperature,
-                   "max_tokens": settings.max_tokens, "response_format": self.response_format()}
-        if settings.reasoning_effort is not None:
+                   "max_tokens": settings.max_tokens, "response_format": self.response_format(role)}
+        if role != "reviewer" and settings.reasoning_effort is not None:
             payload["reasoning_effort"] = settings.reasoning_effort
-        if settings.enable_thinking is not None:
+        if role != "reviewer" and settings.enable_thinking is not None:
             payload["chat_template_kwargs"] = {"enable_thinking": settings.enable_thinking}
         async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
             started = time.monotonic()
@@ -83,8 +86,10 @@ class RecordingProvider:
                     pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
 
-    def response_format(self):
+    def response_format(self, role="main"):
         value = {"type": "json_object"}
-        if self.store.get(self.run_id)["profile"].get("constrain_actions", True):
+        # llama-server accepts the extended schema form; OpenAI's compatible
+        # endpoint currently accepts JSON-object mode but rejects schema here.
+        if role != "reviewer" and self.store.get(self.run_id)["profile"].get("constrain_actions", True):
             value["schema"] = action_schema()
         return value

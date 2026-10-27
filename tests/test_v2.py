@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from coding_agent import CheckSpec, Harness, TaskRequest
+from coding_agent.config import AgentConfig, ConfigError
 from coding_agent.checks import Checks
 from coding_agent.engine import Engine
 from coding_agent.model import ModelError
@@ -225,6 +226,18 @@ else: raise AssertionError("dependency was writable")
         Engine(self.harness.store, run_id, provider).execute()
         self.assertEqual(self.harness.status(run_id).state, "completed", self.harness.status(run_id).error)
         self.assertEqual(self.harness.result(run_id).outcome, "unverified")
+
+    def test_reviewer_is_configurable_and_must_use_a_distinct_endpoint(self):
+        data = {
+            "main": {"base_url": "https://main.example/v1", "model": "writer", "api_key_env": "LLAMA_API_KEY"},
+            "subagents": {"base_url": "https://subs.example/v1", "model": "worker", "api_key_env": "LLAMA_API_KEY"},
+            "reviewer": {"base_url": "https://api.openai.com/v1", "model": "gpt-4.1-mini"},
+        }
+        config = AgentConfig.from_mapping(data)
+        self.assertEqual(config.reviewer.api_key_env, "OPENAI_API_KEY")
+        self.assertEqual(config.reviewer.base_url, "https://api.openai.com/v1")
+        with self.assertRaises(ConfigError):
+            AgentConfig.from_mapping({**data, "reviewer": {"base_url": "https://main.example/v1", "model": "reviewer"}})
 
     def test_cancel_queued_job_and_pagination(self):
         one = self.harness.submit(request(self.source))

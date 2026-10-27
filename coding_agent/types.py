@@ -30,6 +30,7 @@ class Profile(Contract):
     command_timeout_seconds: float = Field(default=600, gt=0)
     max_specialists: int = Field(default=9, ge=0, le=9)
     worker_max_actions: int = Field(default=12, ge=1, le=100)
+    review_no_progress_actions: int = Field(default=24, ge=6, le=200)
     main_context_bytes: int = Field(default=24000, ge=4000, le=120000)
     worker_context_bytes: int = Field(default=12000, ge=2000, le=60000)
     allow_network: bool = False
@@ -45,6 +46,7 @@ class TaskRequest(Contract):
     profile: str | None = None
     checks: list[CheckSpec] = Field(default_factory=list, max_length=50)
     readonly_dependencies: list[str] = Field(default_factory=list, max_length=20)
+    focus_paths: list[str] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def check_graph(self):
