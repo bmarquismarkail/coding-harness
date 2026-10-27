@@ -20,6 +20,7 @@ class Checks:
         self.path = workspace.folder / "checks.json"
 
     def initialize(self, request: TaskRequest):
+        self._request_specs = list(request.checks)
         if self.path.exists():
             return
         checks = [{"spec": c.model_dump(), "origin": "request", "oracle": {}} for c in request.checks]
@@ -134,6 +135,11 @@ class Checks:
             self.store.consume(self.run_id)
             results.append(self.execute(item["spec"]["id"], phase, key=f"{prefix}:{item['spec']['id']}"))
         return results
+
+    def run_requested(self, phase: str, prefix: str):
+        """Run only checks explicitly requested for a review job."""
+        requested = {c.id for c in self._request_specs}
+        return [self.execute(check_id, phase, key=f"{prefix}:{check_id}") for check_id in requested]
 
     def finish(self, request: TaskRequest, summary: str, findings: list, gaps: list[str]) -> RunResult:
         patch = self.workspace.patch()

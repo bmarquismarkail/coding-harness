@@ -426,6 +426,9 @@ class Engine:
             self.store.transition(self.run_id, "running")
             if self.request.mode == "implement":
                 self.checks.run_all("baseline", "initial:baseline")
+            elif self.request.checks:
+                self.checks.run_requested("baseline", "review:baseline")
+                self.checks.run_requested("candidate", "review:candidate")
             with SqliteSaver.from_conn_string(str(self.workspace.folder / "checkpoints.sqlite")) as saver:
                 graph = self.graph(saver)
                 config = {"configurable": {"thread_id": f"{self.run_id}:{self.revision}"}, "recursion_limit": self.profile.max_actions*3+30}
