@@ -170,6 +170,13 @@ class Workspace:
         self.meta.write_text(json.dumps(metadata, indent=2))
         return metadata
 
+    def changed_paths(self) -> list[str]:
+        """List snapshot paths whose contents, mode, or presence changed."""
+        baseline = json.loads(self.meta.read_text())["baseline"]
+        candidate = manifest(self.root)
+        return sorted(path for path in baseline.keys() | candidate.keys()
+                      if baseline.get(path) != candidate.get(path))
+
     def patch(self, scope: list[str] | None = None) -> str:
         index = self.folder / "diff.index"
         shutil.copy2(self.folder / "baseline.index", index)

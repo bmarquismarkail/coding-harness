@@ -113,6 +113,51 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.evidence.patch_source_hash,
                          next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
 
+    def test_investigative_draft_does_not_block_verified_repair(self):
+        """Keep a working draft available without treating it as a final finding."""
+        draft = {"id": "iterator", "title": "Iterator bug", "claim": "Generators have no len()",
+                 "path": "latency.py"}
+
+        class DraftProvider(RepairProvider):
+            def invoke(self, messages, *, role):
+                """File one draft before the writer proceeds with the repair."""
+                if role == "main" and self.main_calls == 1 and not hasattr(self, "drafted"):
+                    self.drafted = True
+                    return json.dumps({"type": "tool", "tool": "report_findings", "args": {"findings": [draft]}})
+                return super().invoke(messages, role=role)
+
+        run_id = self.harness.submit(request(self.source))
+        Engine(self.harness.store, run_id, DraftProvider()).execute()
+        result = self.harness.result(run_id)
+        self.assertEqual(result.outcome, "verified", result.gaps)
+        self.assertEqual(result.review.completion, "partial")
+        self.assertIn("unexamined_scope", result.review.partial_reasons)
+        receipts = self.harness.store.receipts(run_id, "draft_findings")
+        self.assertEqual(len(receipts), 1)
+        artifact = receipts[0]["data"]["artifact_id"]
+        raw = (self.harness.store.run_dir(run_id) / "artifacts" / artifact).read_text()
+        self.assertEqual(json.loads(raw)["findings"][0]["id"], draft["id"])
+
+    def test_final_specialist_finding_blocks_verification(self):
+        """Require resolution of concrete findings raised by the final specialist."""
+        finding = {"id": "regression", "title": "Candidate defect", "claim": "Needs resolution",
+                   "path": "latency.py"}
+
+        class FindingProvider(RepairProvider):
+            def invoke(self, messages, *, role):
+                """Return a concrete finding from the specialist review."""
+                if role == "subagent":
+                    return json.dumps({"type": "finish", "summary": "Reviewed candidate",
+                                       "findings": [finding], "review": {"observations": ["Checks ran"]}})
+                return super().invoke(messages, role=role)
+
+        run_id = self.harness.submit(request(self.source))
+        Engine(self.harness.store, run_id, FindingProvider()).execute()
+        result = self.harness.result(run_id)
+        self.assertEqual(result.outcome, "unverified")
+        self.assertIn("Concrete review findings require resolution.", result.gaps)
+        self.assertEqual([item.proposal.id for item in result.review.findings], [finding["id"]])
+
     def test_wrong_patch_cannot_claim_verification(self):
         run_id = self.harness.submit(request(self.source))
         Engine(self.harness.store, run_id, RepairProvider('def mean_latency(samples):\n    return 20\n')).execute()

@@ -1,6 +1,7 @@
 """Immutable evidence, bounded presentation, and mechanical adjudication."""
 import hashlib
 import json
+from pathlib import Path
 from .review_types import (ImmutableEvidenceBundle, ReviewerEvidenceView, ReviewerResponse,
                            FindingProposal, AdjudicatedFinding, ReviewDetails, Coverage)
 from .workspace import tree_hash, checked_path, digest
@@ -17,6 +18,7 @@ def read_json(store, run_id, artifact_id):
 
 
 def freeze_bundle(engine, coverage=None):
+    """Persist source, patch, and check evidence and update coverage from valid reads."""
     store, rid, workspace = engine.store, engine.run_id, engine.workspace
     checks, sources, probes, gaps = [], [], [], []
     for receipt in store.receipts(rid, 'check'):
@@ -53,7 +55,13 @@ def freeze_bundle(engine, coverage=None):
         patch_artifact_id=store.artifact(rid, workspace.patch()), definitions=engine.checks.definitions(),
         checks=checks, source_evidence=sources, defect_probes=probes,
         coverage=coverage or Coverage(), integrity_gaps=gaps)
-    bundle.coverage.examined_paths = sorted({s["path"] for s in sources if s["valid"] and s["phase"] == "candidate"})
+    bundle.coverage.examined_paths = sorted({
+        Path(source["path"]).as_posix()
+        for source in sources
+        if source["valid"] and not source.get("truncated_line")
+        and (source["end"] >= source["start"] or source.get("total_lines") == 0)
+        and (source["phase"] == "candidate" or not (workspace.root / source["path"]).is_file())
+    })
     artifact_id = store.artifact(rid, bundle.model_dump())
     store.event(rid, 'evidence_bundle', {'artifact_id': artifact_id})
     return bundle, artifact_id
@@ -100,6 +108,7 @@ def normalize_response(raw):
     """Accept typed responses and legacy reports without silently dropping concerns."""
     if raw.get('review') is not None:
         response = ReviewerResponse.model_validate(raw['review'])
+        response.findings.extend(FindingProposal.model_validate(f) for f in raw.get('findings', []))
         response.semantic_concerns = list(dict.fromkeys([*response.semantic_concerns, *raw.get('gaps', [])]))
         return response
     if any(k in raw for k in ('challenges', 'observations', 'semantic_concerns')):
