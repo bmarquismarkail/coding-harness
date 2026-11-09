@@ -1,6 +1,7 @@
 """Provider-free v0.3 acceptance and adversarial evidence regressions."""
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -31,7 +32,11 @@ class EvidenceTests(unittest.TestCase):
         self.rid = self.harness.submit(self.request)
         self.engine = Engine(self.harness.store, self.rid, provider=object())
         self.engine.workspace.prepare(self.source)
-        shutil.copy2(FIXTURE/'workspace/level.hpp', self.engine.workspace.root/'level.hpp')
+        target = self.engine.workspace.root/'level.hpp'
+        original_mtime = target.stat().st_mtime_ns
+        shutil.copyfile(FIXTURE/'workspace/level.hpp', target)
+        # The archived variants have the same size. Give Git a distinct stat entry.
+        os.utime(target, ns=(original_mtime, original_mtime + 2_000_000_000))
         self.engine.checks.initialize(self.request)
         for receipt in self.record['receipts']:
             data = receipt['data']
@@ -41,11 +46,21 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(raw).hexdigest(), aid)
                 self.assertEqual(self.harness.store.artifact(self.rid, raw), aid)
             self.harness.store.save_receipt(self.rid, receipt['key'], receipt['kind'], receipt['state'], data)
-        self.raw = json.loads((FIXTURE/'artifacts'/self.record['review_artifact']).read_text())['results'][0]
-        # Explicit fixture projection of the archived report into the new reviewer protocol.
-        # Original bytes remain in the proposal artifact, not rewritten in the archive.
-        self.typed = {**self.raw, 'review': {
-            'observations': [self.raw['findings'][0]['note']],
+        archive_id = self.record['review_artifact']
+        archive = (FIXTURE/'artifacts'/archive_id).read_bytes()
+        self.assertEqual(self.harness.store.artifact(self.rid, archive), archive_id)
+        self.raw = json.loads(archive)['results'][0]
+        # Migrate only the archived assertion represented by the two challenges.
+        # Any other legacy gaps still go through normal semantic-concern handling.
+        migrated_gap = (
+            'No independent reproduction of the baseline acceptance failure (exit 1) was performed; '
+            'candidate acceptance pass is not yet independently confirmed against a fresh run.'
+        )
+        self.assertIn(migrated_gap, self.raw['gaps'])
+        observation, *other_findings = self.raw['findings']
+        self.typed = {**self.raw, 'findings': other_findings,
+                      'gaps': [gap for gap in self.raw['gaps'] if gap != migrated_gap], 'review': {
+            'observations': [observation['note']],
             'challenges': [{'kind': 'check_missing', 'check_id': 'acceptance', 'phase': p}
                            for p in ('baseline', 'candidate')]}}
 
@@ -68,14 +83,15 @@ class EvidenceTests(unittest.TestCase):
         bundle, aid = self.bundle()
         findings, gaps, decision = adjudicate_response(self.harness.store, bundle, aid, self.typed)
         self.assertFalse(findings)
-        self.assertEqual(gaps, self.raw['gaps'])
-        self.assertEqual(self.finish(gaps).outcome, 'unverified')
-        self.assertTrue(read_json(self.harness.store, self.rid, decision)['decisions'])
+        self.assertFalse(gaps)
+        self.assertEqual(self.finish(gaps).outcome, 'verified')
+        decisions = read_json(self.harness.store, self.rid, decision)['decisions']
+        self.assertEqual([item['supported'] for item in decisions], [False, False])
         with self.harness.store.db() as db:
             db.execute("DELETE FROM receipts WHERE run_id=? AND kind='check' AND json_extract(data,'$.phase')='candidate'", (self.rid,))
         bundle, aid = self.bundle()
         _, gaps, _ = adjudicate_response(self.harness.store, bundle, aid, self.typed)
-        self.assertTrue(gaps)
+        self.assertEqual(gaps, ['Required evidence missing: candidate/acceptance'])
         self.assertEqual(self.finish(gaps).outcome, 'unverified')
 
     def test_independent_reviewer_challenge_uses_same_canonical_receipts(self):
@@ -147,10 +163,15 @@ class EvidenceTests(unittest.TestCase):
             id='bound', title='Bound', claim='Root cause speculation', path='level.hpp', defect_id='bound')]})
         self.assertEqual(found[0].status, 'needs_human_review')
 
-    def test_outer_gaps_survive_nested_observations(self):
-        from coding_agent.evidence import normalize_response
-        response = normalize_response({'review': {'observations': ['Nothing found']}, 'gaps': ['Still unknown']})
-        self.assertEqual(response.semantic_concerns, ['Still unknown'])
+    def test_genuine_concerns_survive_rejected_factual_challenges(self):
+        bundle, aid = self.bundle()
+        legacy_gap = 'The acceptance check exercises only one difficulty.'
+        semantic_concern = 'The original report does not assess negative inputs.'
+        report = {**self.typed, 'gaps': [legacy_gap],
+                  'review': {**self.typed['review'], 'semantic_concerns': [semantic_concern]}}
+        _, gaps, _ = adjudicate_response(self.harness.store, bundle, aid, report)
+        self.assertEqual(gaps, [semantic_concern, legacy_gap])
+        self.assertEqual(self.finish(gaps).outcome, 'unverified')
 
     def test_complete_view_budget_and_manifest(self):
         bundle, aid = self.bundle()
@@ -294,6 +315,56 @@ class InvestigationTests(unittest.TestCase):
             ticks = iter([0, 3])
             scope = discover_scope(workspace, Profile(name='test'), clock=lambda: next(ticks))
             self.assertEqual(scope.limit_reached, 'seconds')
+
+    def test_scope_limits_keep_patch_and_focus_seeds(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            for i in range(201):
+                (source/f'f{i:03d}.py').write_text('value = 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            (workspace.root/'f200.py').write_text('value = 2\n')
+            cases = [
+                (Profile(name='paths'), (), True, ['f200.py'], 'paths'),
+                (Profile(name='paths'), ['f200.py'], False, ['f200.py'], 'paths'),
+                (Profile(name='bytes', discovery_bytes=1), ['f199.py'], True, ['f200.py', 'f199.py'], 'bytes'),
+            ]
+            for profile, focus, implementation, expected, limit in cases:
+                with self.subTest(limit=limit, focus=focus, implementation=implementation):
+                    scope = discover_scope(workspace, profile, focus, implementation=implementation)
+                    self.assertEqual(scope.intended_paths, expected)
+                    self.assertEqual(scope.limit_reached, limit)
+                    self.assertTrue(scope.unenumerated_remainder)
+
+    def test_review_completion_requires_evidence_for_each_intended_path(self):
+        for second_read in (None, {'start': 2}, {'baseline': True}, {}):
+            with self.subTest(second_read=second_read), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); source = root/'source'; source.mkdir()
+                (source/'src').mkdir()
+                (source/'src/read.py').write_text('first = 1\n')
+                (source/'src/unread.py').write_text('second = 2\n')
+                harness = Harness(root/'state', autostart=False)
+                rid = harness.submit(TaskRequest(root=str(source), task='Review both files', mode='review',
+                                                 focus_paths=['src']))
+                actions = [{'type': 'tool', 'tool': 'read_file', 'args': {'path': 'src/read.py'}}]
+                if second_read is not None:
+                    actions.append({'type': 'tool', 'tool': 'read_file',
+                                    'args': {'path': 'src/unread.py', **second_read}})
+                actions = iter([*actions, {'type': 'finish', 'summary': 'Finished review'}])
+
+                class Provider:
+                    def invoke(self, messages, *, role):
+                        return '{}' if role == 'reviewer' else json.dumps(next(actions))
+
+                Engine(harness.store, rid, Provider()).execute()
+                review = harness.result(rid).review
+                covered = second_read == {}
+                self.assertEqual(review.coverage.intended_paths, ['src/read.py', 'src/unread.py'])
+                self.assertEqual(review.coverage.examined_paths,
+                                 ['src/read.py', 'src/unread.py'] if covered else ['src/read.py'])
+                self.assertEqual(review.completion, 'completed' if covered else 'partial')
+                self.assertEqual(review.partial_reasons, [] if covered else ['unexamined_scope'])
 
     def test_transitive_discovery_mode_changes_and_cancellation(self):
         from coding_agent.workspace import Workspace

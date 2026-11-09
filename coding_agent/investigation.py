@@ -8,13 +8,29 @@ from .workspace import paths
 
 def discover_scope(workspace, profile, focus_paths=(), *, implementation=False,
                    clock=time.monotonic, cancelled=lambda: False):
-    import hashlib
+    if cancelled():
+        return Coverage(limit_reached='cancelled', unenumerated_remainder=True)
+
+    # Establish scope from the complete path inventory and the exact patch
+    # before applying budgets to lexical dependency discovery.
+    available = dict(paths(workspace.root))
+    patch_paths = workspace.changed_paths() if implementation else []
+    for path in patch_paths:
+        available.setdefault(path, workspace.baseline / path)
+    focused = []
+    for focus in focus_paths:
+        focus = Path(focus).as_posix()
+        matches = sorted(path for path in available
+                         if path == focus or focus == '.' or path.startswith(focus + '/'))
+        focused.extend(matches or [focus])
+    seeds = list(dict.fromkeys([*patch_paths, *focused]))
+    if not implementation and not focus_paths:
+        seeds = sorted(available)
+
+    included = seeds[:profile.discovery_paths]
+    omitted = seeds[profile.discovery_paths:]
+    limit = 'paths' if omitted else None
     started = clock()
-    used = 0
-    limit = None
-    omitted = []
-    snapshots = []
-    known = set()
 
     def stop():
         nonlocal limit
@@ -26,72 +42,42 @@ def discover_scope(workspace, profile, focus_paths=(), *, implementation=False,
             limit = 'seconds'
         return limit is not None
 
-    # Bound preparation as well as navigation. Hash in chunks so cancellation
-    # and the clock are checked even within large files.
-    for root in (workspace.baseline, workspace.root):
-        snapshot = {}
-        iterator = iter(paths(root))
-        while not stop():
-            item = next(iterator, None)
-            if item is None:
-                break
-            path, source = item
-            if path not in known and len(known) >= profile.discovery_paths:
-                omitted.append(path)
-                limit = 'paths'
-                break
-            known.add(path)
-            size = source.stat().st_size
-            if used + size > profile.discovery_bytes:
-                omitted.append(path)
-                limit = 'bytes'
-                break
-            raw = bytearray()
-            hasher = hashlib.sha256()
-            with source.open('rb') as stream:
-                while not stop():
-                    chunk = stream.read(min(65536, profile.discovery_bytes - used + 1))
-                    if not chunk:
-                        break
-                    used += len(chunk)
-                    if used > profile.discovery_bytes:
-                        limit = 'bytes'
-                        break
-                    hasher.update(chunk)
-                    raw.extend(chunk)
-            if limit:
-                omitted.append(path)
-                break
-            snapshot[path] = (hasher.hexdigest(), source.stat().st_mode & 0o777,
-                              raw.decode(errors='replace'))
-        snapshots.append(snapshot)
+    used = 0
+    sources = {}
+    ordered = sorted(available, key=lambda path: (path not in included, path))
+    for path in ordered[:profile.discovery_paths]:
+        if stop():
+            break
+        source = available[path]
+        if used + source.stat().st_size > profile.discovery_bytes:
+            limit = 'bytes'
+            break
+        raw = bytearray()
+        with source.open('rb') as stream:
+            while not stop():
+                chunk = stream.read(min(65536, profile.discovery_bytes - used + 1))
+                if not chunk:
+                    break
+                used += len(chunk)
+                if used > profile.discovery_bytes:
+                    limit = 'bytes'
+                    break
+                raw.extend(chunk)
         if limit:
             break
-    baseline = snapshots[0]
-    candidate = snapshots[1] if len(snapshots) > 1 else {}
-    available = {**baseline, **candidate}
-    if implementation:
-        seeds = sorted(p for p in available if baseline.get(p, (None, None))[:2]
-                       != candidate.get(p, (None, None))[:2])
-    elif focus_paths:
-        seeds = sorted(p for p in available if any(p == f or f == '.' or p.startswith(f.rstrip('/') + '/') for f in focus_paths))
-    else:
-        seeds = sorted(available)
-    seeds += [p for p in focus_paths if p not in seeds and p not in available]
-    included = list(dict.fromkeys(seeds[:profile.discovery_paths]))
-    omitted.extend(seeds[profile.discovery_paths:])
-    if len(seeds) > profile.discovery_paths and not limit:
-        limit = 'paths'
+        sources[path] = raw.decode(errors='replace')
+
     names = {Path(p).stem for p in included}
     edges = set()
     # Revisit cached source when new declarations or modules expand the scope.
     changed = True
     while changed and not stop():
         changed = False
-        ordered = sorted(available.items(), key=lambda item: (item[0] not in included, item[0]))
-        for path, (_, _, text) in ordered:
+        ordered_sources = sorted(sources, key=lambda path: (path not in included, path))
+        for path in ordered_sources:
             if stop():
                 break
+            text = sources[path]
             tokens = set(re.findall(r'[A-Za-z_][A-Za-z_0-9]*', text))
             links = re.findall(r'(?:#\s*include\s*["<]([^">]+)|(?:from|import)\s+([\w.]+))', text)
             related = []
@@ -125,6 +111,8 @@ def discover_scope(workspace, profile, focus_paths=(), *, implementation=False,
                     included.append(target)
                     names.add(Path(target).stem)
                     changed = True
+    if not limit and len(available) > profile.discovery_paths:
+        limit = 'paths'
     return Coverage(intended_paths=included, omitted_paths=sorted(set(omitted)),
                     limit_reached=limit, unenumerated_remainder=bool(limit))
 

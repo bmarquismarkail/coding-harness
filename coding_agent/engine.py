@@ -407,11 +407,14 @@ class Engine:
                         review_gaps.extend(item_gaps)
             gaps = [*action.gaps, *review_gaps, *self.bundle.integrity_gaps]
             findings = list(action.findings)
-            draft = []
-            for receipt in self.store.receipts(self.run_id, "draft_findings"):
-                draft.extend(read_json(self.store, self.run_id, receipt["data"]["artifact_id"])["findings"])
-            proposed = action.review.model_dump() if action.review else {"findings": action.findings}
-            proposed["findings"] = [*draft, *proposed["findings"], *(action.findings if action.review else [])]
+            proposed = action.review.model_dump() if action.review else {"findings": []}
+            proposed["findings"].extend(action.findings)
+            # Working drafts remain recoverable. An implementation finding
+            # becomes active when it is submitted as part of the final review.
+            if self.request.mode == "review" or state.get("forced_finish"):
+                for receipt in self.store.receipts(self.run_id, "draft_findings"):
+                    draft = read_json(self.store, self.run_id, receipt["data"]["artifact_id"])
+                    proposed["findings"].extend(draft["findings"])
             if proposed.get("findings") or action.review:
                 _, proposal_gaps = self.evaluate_review(proposed)
                 gaps.extend(proposal_gaps)
@@ -431,21 +434,22 @@ class Engine:
                     self.broker.read_evidence(EvidenceArgs(artifact_id=evidence_id))
                 except (ValueError, OSError, KeyError):
                     gaps.append("The diagnosis cites stale, missing, or non-source evidence.")
-            result = self.checks.finish(self.request, action.summary, findings, gaps,
-                                        diagnosis=action.diagnosis or action.summary,
-                                        diagnosis_sources=action.diagnosis_sources,
-                                        skill_snapshots=self.skill_snapshots)
             reasons = list(state.get("partial_reasons", []))
             if any(g.startswith(("Invalid reviewer response", "Independent reviewer unavailable")) for g in gaps):
                 reasons.append("protocol_failure")
             if self.coverage.limit_reached:
                 reasons.append("scope_limit")
+            if self.request.mode == "implement":
+                gaps.extend(reasons)
+            if set(self.coverage.intended_paths) - set(self.coverage.examined_paths):
+                reasons.append("unexamined_scope")
+            result = self.checks.finish(self.request, action.summary, findings, gaps,
+                                        diagnosis=action.diagnosis or action.summary,
+                                        diagnosis_sources=action.diagnosis_sources,
+                                        skill_snapshots=self.skill_snapshots)
             result.review = ReviewDetails(completion="partial" if reasons else "completed", partial_reasons=reasons,
                 findings=self.review_findings, bundle_id=self.bundle_id, coverage=self.coverage,
                 adjudication_id=self.store.artifact(self.run_id, {"decisions": self.adjudication_ids}))
-            if reasons and result.outcome == "verified":
-                result.outcome = "unverified"
-                result.gaps.extend(reasons)
             attempts = state.get("final_attempts", 0)+1
             # A premature finish with failed checks returns evidence to the writer.
             # This is bounded and checkpointed, never an automatic success upgrade.
