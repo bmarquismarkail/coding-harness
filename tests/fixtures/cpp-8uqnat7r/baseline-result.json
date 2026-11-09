@@ -1,0 +1,9 @@
+{
+  "baseline_commit": "86a75251b1ad64a698926ac623d1dcc58d5be680",
+  "outcome": "unverified",
+  "gaps": [
+    "No independent reproduction of the baseline acceptance failure (exit 1) was performed; candidate acceptance pass is not yet independently confirmed against a fresh run."
+  ],
+  "candidate_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+  "review_artifact": "c729a5d82f112d49c24163ead009dbf45f02118afed1ca6596398e8228a792b8"
+}

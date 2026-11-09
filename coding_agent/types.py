@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
+from .contracts import Contract
+from .review_types import DefectProbeSpec, ReviewDetails, ReviewerResponse
 
-
-class Contract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class CheckSpec(Contract):
@@ -30,6 +29,11 @@ class Profile(Contract):
     command_timeout_seconds: float = Field(default=600, gt=0)
     max_specialists: int = Field(default=9, ge=0, le=9)
     worker_max_actions: int = Field(default=12, ge=1, le=100)
+    protocol_failure_limit: int = Field(default=3, ge=1, le=20)
+    discovery_edges: int = Field(default=2000, ge=1)
+    discovery_paths: int = Field(default=200, ge=1)
+    discovery_bytes: int = Field(default=4194304, ge=1)
+    discovery_seconds: float = Field(default=2, gt=0)
     review_no_progress_actions: int = Field(default=24, ge=6, le=200)
     main_context_bytes: int = Field(default=24000, ge=4000, le=120000)
     worker_context_bytes: int = Field(default=12000, ge=2000, le=60000)
@@ -48,6 +52,7 @@ class TaskRequest(Contract):
     skill_ids: list[str] | None = Field(default=None, max_length=20)
     checks: list[CheckSpec] | None = Field(default=None, max_length=50)
     readonly_dependencies: list[str] = Field(default_factory=list, max_length=20)
+    defect_probes: list[DefectProbeSpec] = Field(default_factory=list, max_length=50)
     focus_paths: list[str] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
@@ -57,6 +62,12 @@ class TaskRequest(Contract):
             if check.id in known or not set(check.requires) <= known:
                 raise ValueError("check IDs must be unique and prerequisites must occur earlier")
             known.add(check.id)
+        if len({p.check_id for p in self.defect_probes}) != len(self.defect_probes):
+            raise ValueError("one trusted probe is permitted per check")
+        if len({p.defect_id for p in self.defect_probes}) != len(self.defect_probes):
+            raise ValueError("duplicate defect ID")
+        if self.checks is not None and any(p.check_id not in known for p in self.defect_probes):
+            raise ValueError("probe must reference a caller-configured check")
         if not self.task.strip():
             raise ValueError("task must not be blank")
         return self
@@ -91,6 +102,7 @@ class EvidencePackage(Contract):
 
 
 class RunResult(Contract):
+    review: ReviewDetails | None = None
     run_id: str
     outcome: Literal["verified", "unverified", "failed", "cancelled"]
     summary: str
@@ -110,6 +122,7 @@ class ToolAction(Contract):
 
 
 class FinishAction(Contract):
+    review: ReviewerResponse | None = None
     type: Literal["finish"]
     summary: str = Field(min_length=1, max_length=12000)
     findings: list[dict[str, Any]] = Field(default_factory=list, max_length=30)

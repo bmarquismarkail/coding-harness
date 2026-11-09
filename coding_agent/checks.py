@@ -111,8 +111,28 @@ class Checks:
                 self.store.save_receipt(self.run_id, key, "check", "completed", result)
                 return result
         self.store.save_receipt(self.run_id, key, "check", "started", {"check_id": check_id, "phase": phase, "source_hash": fingerprint})
+        probe_definitions = []
+        for receipt in self.store.receipts(self.run_id, "probe_definition"):
+            from .evidence import read_json
+            probe = read_json(self.store, self.run_id, receipt["data"]["artifact_id"])
+            if probe["check_id"] == check_id:
+                probe_definitions.append((receipt["data"]["artifact_id"], probe))
+        if len(probe_definitions) > 1:
+            raise ValueError("one trusted probe is permitted per check")
+        runner, argv = self.runner, spec.argv
+        probe_id = None
+        if probe_definitions:
+            probe_id, probe = probe_definitions[0]
+            if probe.get("check_spec") != spec.model_dump():
+                raise RuntimeError("trusted check definition changed")
+            wrapper = self.store.run_dir(self.run_id) / "artifacts" / probe["wrapper_artifact"]
+            if hashlib.sha256(wrapper.read_bytes()).hexdigest() != probe["wrapper_artifact"]:
+                raise RuntimeError("trusted wrapper integrity mismatch")
+            runner = SandboxRunner(self.runner.profile, self.runner.dependencies, self.runner.cancelled)
+            runner.protected_files = {"/trusted-probe.py": wrapper}
+            argv = [sys.executable, "-I", "/trusted-probe.py", *spec.argv]
         try:
-            result = self.runner.run(root, spec.argv, cwd=spec.cwd, timeout=spec.timeout_seconds)
+            result = runner.run(root, argv, cwd=spec.cwd, timeout=spec.timeout_seconds)
         except CommandCancelled as exc:
             data = {**exc.result, "check_id": check_id, "phase": phase, "source_hash": fingerprint, "passed": False}
             data["artifact_id"] = self.store.artifact(self.run_id, data)
@@ -123,6 +143,11 @@ class Checks:
         result.update(check_id=check_id, phase=phase, source_hash=fingerprint, origin=definition["origin"],
                       passed=result["exit_code"] == 0 and not result["timed_out"] and not altered and not result["output_truncated"],
                       source_modified=altered, skipped=False, executed_at=time.time())
+        if probe_id:
+            result["probe_definition_id"] = probe_id
+            target = checked_path(root, probe['path'])
+            result["probe_target_valid"] = (phase == probe['phase'] and fingerprint == probe['source_hash']
+                and target.is_file() and len(target.read_text(errors='replace').splitlines()) >= probe['end_line'])
         artifact = self.store.artifact(self.run_id, result)
         result["artifact_id"] = artifact
         self.store.save_receipt(self.run_id, key, "check", "completed", result)
@@ -152,15 +177,15 @@ class Checks:
         candidates = sorted([r for r in records if r.get("phase") == "candidate" and r.get("source_hash") == fingerprint],
                             key=lambda r:r.get("executed_at", 0))
         final_by_id = {r["check_id"]: r for r in candidates}
-        for check in definitions:
+        for check in definitions if request.mode == "implement" else []:
             last = final_by_id.get(check["spec"]["id"])
             if not last or not last.get("passed"):
                 gaps.append(f"Required check {check['spec']['id']} did not pass on the final source.")
         acceptance = [c for c in definitions if c["spec"]["kind"] == "acceptance"]
         regressions = [c for c in definitions if c["spec"]["kind"] == "regression"]
-        if not acceptance:
+        if request.mode == "implement" and not acceptance:
             gaps.append("No executable acceptance check was established.")
-        if not regressions:
+        if request.mode == "implement" and not regressions:
             gaps.append("No independent existing regression suite was established.")
         baseline_root = self.workspace.baseline_check_root()
         expected_baseline = manifest(self.workspace.baseline)
@@ -169,7 +194,7 @@ class Checks:
         if manifest(baseline_root) != expected_baseline:
             gaps.append("Baseline execution sources no longer match the original snapshot and frozen oracles.")
         baseline_hash = tree_hash(baseline_root)
-        for check in acceptance:
+        for check in acceptance if request.mode == "implement" else []:
             base = [r for r in records if r.get("phase") == "baseline" and r["check_id"] == check["spec"]["id"]
                     and r.get("source_hash") == baseline_hash]
             if request.task_type in {"bugfix", "feature"} and not any(

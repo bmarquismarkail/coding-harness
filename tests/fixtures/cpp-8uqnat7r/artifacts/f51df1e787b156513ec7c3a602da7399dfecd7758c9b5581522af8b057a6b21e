@@ -1,0 +1,1 @@
+{"argv": ["./build-regression"], "check_id": "regression", "cwd": ".", "elapsed_seconds": 0.054, "exit_code": 0, "origin": "request", "output": "", "output_truncated": false, "passed": true, "phase": "candidate", "skipped": false, "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf", "source_modified": false, "timed_out": false}

@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from .types import CheckSpec, TaskRequest
+from .review_types import DefectProbeSpec
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _MAX_SKILL_BYTES = 40_000
@@ -77,8 +78,9 @@ def resolve_request(request: TaskRequest, root: Path, definitions: dict[str, dic
     if sum(len(item["content"].encode("utf-8")) for item in skills) > _MAX_TOTAL_SKILL_BYTES:
         raise ValueError("selected skills exceed the combined context limit")
     resolved = request.model_copy(update={"root": str(root), "project_profile": selected,
-                                         "skill_ids": list(skill_ids), "checks": checks})
-    return resolved, skills
+                                         "skill_ids": list(skill_ids), "checks": checks,
+                                         "defect_probes": request.defect_probes if "defect_probes" in request.model_fields_set else [DefectProbeSpec.model_validate(p) for p in definition.get("defect_probes", [])]})
+    return TaskRequest.model_validate(resolved.model_dump()), skills
 
 
 def skill_context(skills: list[dict]) -> str:

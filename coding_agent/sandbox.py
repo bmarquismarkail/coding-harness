@@ -27,6 +27,7 @@ class SandboxRunner:
         self.profile = profile
         self.dependencies = dependencies or []
         self.cancelled = cancelled
+        self.protected_files = {}
 
     def command(self, root: Path, argv: list[str], cwd: str = ".") -> list[str]:
         if not argv or any(not isinstance(arg, str) or "\0" in arg for arg in argv):
@@ -62,6 +63,8 @@ class SandboxRunner:
                 raise ValueError("dependency mount must be a specific existing toolchain/dependency path")
             if not str(p).startswith("/usr/"):
                 command.extend(["--ro-bind", str(p), str(p)])
+        for target, source in self.protected_files.items():
+            command.extend(["--ro-bind", str(source), target])
         git_path = root / ".git"
         if git_path.exists():
             command.extend(["--ro-bind", str(git_path), "/workspace/.git"])
