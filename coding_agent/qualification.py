@@ -67,7 +67,8 @@ def report(measurements):
     gates = {'protocol_sample': len(data.protocol) >= minimum,
              'first_response_observed_99': bool(data.protocol) and first / len(data.protocol) >= .99,
              'recall_observed_90': expected > 0 and matched / expected >= .9,
-             'zero_unsupported_critical': bool(clean) and unsupported == 0,
+             'clean_cases_present': bool(clean),
+             'zero_unsupported_critical': unsupported == 0,
              'all_promotions_valid': bool(data.promotions) and all(data.promotions)}
     return {'version': 1, 'purpose': data.purpose, 'configuration': data.configuration,
             'metrics': metrics, 'observed_gates': gates, 'observed_gates_pass': all(gates.values()),
@@ -104,8 +105,7 @@ def prepare_fixtures(root, *, protocol_opportunities=100):
             if language == 'python':
                 (folder/'clamp.py').write_text(f'def clamp(v):\n    return {value} if v > 100 else max(0, v)\n')
                 (folder/'tests/probe.py').write_text('from clamp import clamp\nassert clamp(101) == 100\nassert clamp(-1) == 0\n')
-                import sys
-                checks = [CheckSpec(id='acceptance', argv=[sys.executable, '-c',
+                checks = [CheckSpec(id='acceptance', argv=['python3', '-c',
                     'exec(open("tests/probe.py").read())'])]
                 path = 'clamp.py'
             else:

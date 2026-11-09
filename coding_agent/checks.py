@@ -141,13 +141,21 @@ class Checks:
             raise
         altered = manifest(root) != before
         result.update(check_id=check_id, phase=phase, source_hash=fingerprint, origin=definition["origin"],
-                      passed=result["exit_code"] == 0 and not result["timed_out"] and not altered and not result["output_truncated"],
+                      passed=(result["exit_code"] in probe["not_observed_exit_codes"] if probe_id else result["exit_code"] == 0) and not result["timed_out"] and not altered and not result["output_truncated"],
                       source_modified=altered, skipped=False, executed_at=time.time())
         if probe_id:
             result["probe_definition_id"] = probe_id
-            target = checked_path(root, probe['path'])
-            result["probe_target_valid"] = (phase == probe['phase'] and fingerprint == probe['source_hash']
-                and target.is_file() and len(target.read_text(errors='replace').splitlines()) >= probe['end_line'])
+            try:
+                target = checked_path(root, probe['path'])
+            except ValueError:
+                result['probe_range_valid'] = False
+                result['probe_target_valid'] = False
+            else:
+                result['probe_range_valid'] = (target.is_file()
+                    and len(target.read_text(errors='replace').splitlines()) >= probe['end_line'])
+                result['probe_target_valid'] = (phase == probe['phase'] and fingerprint == probe['source_hash']
+                    and result['probe_range_valid'])
+            result['probe_observed'] = result['exit_code'] in probe['observed_exit_codes']
         artifact = self.store.artifact(self.run_id, result)
         result["artifact_id"] = artifact
         self.store.save_receipt(self.run_id, key, "check", "completed", result)
@@ -199,7 +207,9 @@ class Checks:
                     and r.get("source_hash") == baseline_hash]
             if request.task_type in {"bugfix", "feature"} and not any(
                     not r.get("passed") and not r.get("skipped") and not r.get("timed_out")
-                    and not r.get("source_modified") and r.get("exit_code", 0) not in {0, 77, 126, 127, -9} for r in base):
+                    and not r.get("source_modified") and not r.get("output_truncated")
+                    and (r.get("probe_observed") and r.get("probe_target_valid") if r.get("probe_definition_id")
+                         else r.get("exit_code", 0) not in {0, 77, 126, 127, -9}) for r in base):
                 gaps.append(f"Acceptance check {check['spec']['id']} did not reproduce a baseline failure.")
             if request.task_type == "refactor" and not any(r.get("passed") for r in base):
                 gaps.append(f"Refactor baseline check {check['spec']['id']} did not pass.")

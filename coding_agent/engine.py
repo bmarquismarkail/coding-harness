@@ -15,7 +15,7 @@ from langgraph.types import Command, interrupt
 
 from .checks import Checks
 from .evidence import freeze_bundle, reviewer_view, adjudicate_response, read_json
-from .review_types import ReviewDetails, Coverage, ReviewerResponse
+from .review_types import ReviewDetails, Coverage, ReviewerResponse, FindingProposal
 from .investigation import discover_scope, evidence_progress
 from .config import AgentConfig
 from .profiles import configured_models
@@ -176,8 +176,14 @@ class SpecialistPool:
                     action = parse_action(raw)
                     if isinstance(action, FinishAction):
                         data["result"] = {"id": task.id, **action.model_dump(), "source_hash": data["source_hash"]}
-                        if action.review and action.review.findings:
-                            artifact = e.store.artifact(e.run_id, {"findings": [f.model_dump() for f in action.review.findings]})
+                        drafts = list(action.review.findings) if action.review else []
+                        for item in action.findings:
+                            try:
+                                drafts.append(FindingProposal.model_validate(item))
+                            except ValueError:
+                                continue
+                        if drafts:
+                            artifact = e.store.artifact(e.run_id, {"findings": [f.model_dump() for f in drafts]})
                             e.store.save_receipt(e.run_id, "specialist:" + key, "draft_findings", "completed", {"artifact_id": artifact})
                         self.save(key, "completed", data)
                         return data["result"]
@@ -337,6 +343,10 @@ class Engine:
                     observation = {"error": str(exc)}
             ledger, progressed = evidence_progress(state.get("progress_ledger", {}), observation, self.coverage.intended_paths)
             if isinstance(action, ToolAction) and action.tool == "apply_patch" and "error" not in observation:
+                for change in action.args.get('changes', []):
+                    if change.get('expected_hash') is None and change.get('content') is not None:
+                        if change['path'] not in self.coverage.intended_paths:
+                            self.coverage.intended_paths.append(change['path'])
                 patch_id = self.store.artifact(self.run_id, self.workspace.patch())
                 progressed = patch_id != ledger.get("patch")
                 ledger["patch"] = patch_id
@@ -368,7 +378,7 @@ class Engine:
                 self.checks.run_all("baseline", final_key+":baseline")
                 self.checks.run_all("candidate", final_key+":candidate")
             self.coverage = discover_scope(self.workspace, self.profile, self.request.focus_paths,
-                                           implementation=self.request.mode == "implement")
+                                           implementation=self.request.mode == "implement", cancelled=self.cancelled)
             self.bundle, self.bundle_id = freeze_bundle(self, self.coverage)
             self.review_findings = []
             self.adjudication_ids = []
@@ -376,12 +386,19 @@ class Engine:
                 targets = self.coverage.intended_paths
                 for offset in range(0, len(targets), 20):
                     view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=2400)
-                    review = WorkerTask(id=f"final-review-{offset}", paths=targets[offset:offset+20], task=(
+                    task_prefix = (
                         "Review candidate and baseline. Return a finish action with review containing findings, observations, "
                         "challenges, semantic_concerns. Findings require id,title,claim,path,start_line,end_line,phase. "
                         "For missing execution evidence use challenges [{kind:check_missing,check_id:ID,phase:candidate}]. "
-                        "No defect found is an observation. Authoritative evidence view: " + json.dumps({
-                            "view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()})))
+                        "No defect found is an observation. Authoritative evidence view: ")
+                    rendered = task_prefix + json.dumps({
+                        "view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()}, ensure_ascii=False, separators=(",", ":"))
+                    if len(rendered) > 4000:
+                        view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=400)
+                        rendered = task_prefix + json.dumps({
+                            "view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()},
+                            ensure_ascii=False, separators=(",", ":"))
+                    review = WorkerTask(id=f"final-review-{offset}", paths=targets[offset:offset+20], task=rendered)
                     self.pool.start([review])
                     report = self.pool.collect([review.id])
                     self.bundle, self.bundle_id = freeze_bundle(self, self.coverage)
@@ -394,14 +411,14 @@ class Engine:
             for receipt in self.store.receipts(self.run_id, "draft_findings"):
                 draft.extend(read_json(self.store, self.run_id, receipt["data"]["artifact_id"])["findings"])
             proposed = action.review.model_dump() if action.review else {"findings": action.findings}
-            proposed["findings"] = [*draft, *proposed["findings"]]
+            proposed["findings"] = [*draft, *proposed["findings"], *(action.findings if action.review else [])]
             if proposed.get("findings") or action.review:
                 _, proposal_gaps = self.evaluate_review(proposed)
                 gaps.extend(proposal_gaps)
-            _, independent_gaps = self.independent_review(action.summary, findings, gaps)
+            _, independent_gaps = self.independent_review(action.summary, [f.proposal.model_dump() for f in self.review_findings], gaps)
             gaps.extend(independent_gaps)
             findings = [f.proposal.model_dump() for f in self.review_findings] + [f for f in findings if "claim" not in f]
-            if self.request.mode == "implement" and self.review_findings:
+            if self.request.mode == "implement" and any(not f.resolved for f in self.review_findings):
                 gaps.append("Concrete review findings require resolution.")
             for finding in findings:
                 for evidence_id in finding.get("evidence_ids", []):
@@ -440,7 +457,7 @@ class Engine:
                             "gaps": result.gaps, "failed_checks": [{k:v for k,v in c.items() if k != "output"} for c in failed_checks[-5:]],
                             "outputs": [c.get("output", "")[-1800:] for c in failed_checks[-3:]]}
                 self.store.event(self.run_id, "repair_feedback", {"artifact_id": self.store.artifact(self.run_id, feedback)})
-                return {"final_attempts": attempts, "messages": [*state["messages"], {"role":"user", "content":json.dumps(feedback)}]}
+                return {"forced_finish": False, "final_attempts": attempts, "messages": [*state["messages"], {"role":"user", "content":json.dumps(feedback)}]}
             return {"result": result.model_dump(), "final_attempts": attempts}
 
         builder = StateGraph(LoopState)
@@ -457,7 +474,11 @@ class Engine:
         try:
             findings, gaps, artifact = adjudicate_response(self.store, self.bundle, self.bundle_id, raw)
             existing = {f.proposal.model_dump_json() for f in self.review_findings}
-            self.review_findings.extend(f for f in findings if f.proposal.model_dump_json() not in existing)
+            for finding in findings:
+                key = finding.proposal.model_dump_json()
+                if key not in existing:
+                    self.review_findings.append(finding)
+                    existing.add(key)
             self.adjudication_ids.append(artifact)
             return findings, gaps
         except (ValueError, OSError, TypeError) as exc:
@@ -486,7 +507,7 @@ class Engine:
             self.workspace.prepare(Path(self.request.root))
             self.checks.initialize(self.request)
             self.pool.reconcile()
-            self.coverage = discover_scope(self.workspace, self.profile, self.request.focus_paths)
+            self.coverage = discover_scope(self.workspace, self.profile, self.request.focus_paths, cancelled=self.cancelled)
             # Read instruction/build metadata before any project execution.
             self.seed(self.broker)
             self.store.transition(self.run_id, "running")

@@ -123,6 +123,7 @@ class ToolBroker:
             allowed.update(WRITE_TOOLS)
             if self.mode == "review":
                 allowed.pop("apply_patch")
+        allowed["report_findings"] = ReportFindingsArgs
         descriptions = {
             "apply_patch": "Create, replace, or delete files. Read existing files first and supply their sha256 as expected_hash; use null only for new files. Preserve the original tests.",
             "run_check": "Execute a registered check on baseline or candidate sources; use this rather than run_command for acceptance evidence.",

@@ -68,8 +68,8 @@ class EvidenceTests(unittest.TestCase):
         bundle, aid = self.bundle()
         findings, gaps, decision = adjudicate_response(self.harness.store, bundle, aid, self.typed)
         self.assertFalse(findings)
-        self.assertFalse(gaps)
-        self.assertEqual(self.finish(gaps).outcome, 'verified')
+        self.assertEqual(gaps, self.raw['gaps'])
+        self.assertEqual(self.finish(gaps).outcome, 'unverified')
         self.assertTrue(read_json(self.harness.store, self.rid, decision)['decisions'])
         with self.harness.store.db() as db:
             db.execute("DELETE FROM receipts WHERE run_id=? AND kind='check' AND json_extract(data,'$.phase')='candidate'", (self.rid,))
@@ -93,7 +93,7 @@ class EvidenceTests(unittest.TestCase):
         self.engine.broker.read_file(ReadArgs(path='level.hpp'))
         bundle, aid = self.bundle()
         original = bundle.model_dump()
-        view = reviewer_view(self.harness.store, bundle, aid, budget=200)
+        view = reviewer_view(self.harness.store, bundle, aid, budget=400)
         self.assertTrue(view.omitted_count)
         self.assertEqual(bundle.model_dump(), original)
         self.assertTrue(read_json(self.harness.store, self.rid, aid)['source_evidence'])
@@ -147,6 +147,119 @@ class EvidenceTests(unittest.TestCase):
             id='bound', title='Bound', claim='Root cause speculation', path='level.hpp', defect_id='bound')]})
         self.assertEqual(found[0].status, 'needs_human_review')
 
+    def test_outer_gaps_survive_nested_observations(self):
+        from coding_agent.evidence import normalize_response
+        response = normalize_response({'review': {'observations': ['Nothing found']}, 'gaps': ['Still unknown']})
+        self.assertEqual(response.semantic_concerns, ['Still unknown'])
+
+    def test_complete_view_budget_and_manifest(self):
+        bundle, aid = self.bundle()
+        bundle.checks *= 30
+        view = reviewer_view(self.harness.store, bundle, aid, budget=2400)
+        self.assertLessEqual(len(view.model_dump_json().encode()), 2400)
+        omitted = read_json(self.harness.store, self.rid, view.omitted_manifest_id)
+        self.assertEqual(view.omitted_count, len(omitted))
+        self.assertEqual(len(view.checks) + len(omitted), len(bundle.checks))
+
+    def test_latest_execution_wins_over_receipt_order(self):
+        bundle, aid = self.bundle()
+        check = next(c for c in bundle.checks if c['phase'] == 'candidate')
+        bundle.checks = [{**check, 'passed': False, 'executed_at': 20},
+                         {**check, 'passed': True, 'executed_at': 10}]
+        aid = self.harness.store.artifact(self.rid, bundle.model_dump())
+        self.harness.store.event(self.rid, 'evidence_bundle', {'artifact_id': aid})
+        _, gaps, _ = adjudicate_response(self.harness.store, bundle, aid, {'challenges': [
+            {'kind': 'check_passed', 'check_id': check['check_id'], 'phase': 'candidate'}]})
+        self.assertTrue(gaps)
+
+    def test_joint_citation_coverage_and_duplicate_proposals(self):
+        (self.engine.workspace.root/'level.hpp').write_text('one\ntwo\nthree\nfour\n')
+        left = self.engine.broker.read_file(ReadArgs(path='level.hpp', start=1, lines=1))
+        right = self.engine.broker.read_file(ReadArgs(path='level.hpp', start=2, lines=2))
+        self.engine.bundle, self.engine.bundle_id = self.bundle()
+        proposal = dict(id='range', title='Range', claim='Possible issue', path='level.hpp',
+                        start_line=1, end_line=3, evidence_ids=[left['evidence_id'], right['evidence_id']])
+        self.engine.review_findings = []; self.engine.adjudication_ids = []
+        found, gaps = self.engine.evaluate_review({'findings': [proposal, proposal]})
+        self.assertFalse(gaps)
+        self.assertEqual(found[0].status, 'hypothesis')
+        self.assertEqual(len(self.engine.review_findings), 1)
+        proposal['end_line'] = 4
+        found, _ = self.engine.evaluate_review({'findings': [proposal]})
+        self.assertEqual(found[0].status, 'needs_human_review')
+
+    def test_specialist_can_only_report_drafts_and_read(self):
+        from coding_agent.tools import ToolBroker
+        broker = ToolBroker(self.harness.store, self.rid, self.engine.workspace, self.engine.checks, scope=['level.hpp'])
+        self.assertIn('report_findings', broker.schemas())
+        for name in ('apply_patch', 'run_command', 'run_check', 'delegate', 'register_check'):
+            with self.assertRaises(PermissionError):
+                broker.invoke(name, {}, key=name)
+        broker.invoke('report_findings', {'findings': [dict(id='draft', title='Draft', claim='Investigate', path='level.hpp')]}, key='draft')
+        self.assertTrue(self.harness.store.receipts(self.rid, 'draft_findings'))
+
+    def test_probe_signals_paths_and_unrelated_errors(self):
+        from coding_agent.sandbox import SandboxRunner
+        from coding_agent.evidence import read_json
+        check = self.engine.checks.definitions()[0]['spec']
+        wrapper = self.harness.store.artifact(self.rid, 'pass')
+        for code, expected in ((0, False), (42, True)):
+            probe = dict(check_id=check['id'], check_spec=check, wrapper_artifact=wrapper,
+                         path='level.hpp', phase='candidate', source_hash=tree_hash(self.engine.workspace.root),
+                         end_line=1, observed_exit_codes=[0], not_observed_exit_codes=[42])
+            aid = self.harness.store.artifact(self.rid, probe)
+            self.harness.store.save_receipt(self.rid, 'probe', 'probe_definition', 'completed', {'artifact_id': aid})
+            execution = dict(exit_code=code, timed_out=False, output_truncated=False, output='')
+            with patch.object(SandboxRunner, 'run', return_value=execution):
+                result = self.engine.checks.execute(check['id'], 'candidate', key=f'signal-{code}')
+            self.assertEqual(result['passed'], expected)
+            self.assertTrue(result['probe_target_valid'])
+            with patch.object(SandboxRunner, 'run', return_value=dict(execution)), patch('coding_agent.checks.checked_path', side_effect=ValueError('excluded')):
+                result = self.engine.checks.execute(check['id'], 'candidate', key=f'invalid-{code}')
+            self.assertFalse(result['probe_target_valid'])
+            self.assertFalse(read_json(self.harness.store, self.rid, result['artifact_id'])['probe_target_valid'])
+            with patch.object(SandboxRunner, 'run', return_value=dict(execution)), patch('coding_agent.checks.checked_path', side_effect=RuntimeError('unexpected')):
+                with self.assertRaises(RuntimeError):
+                    self.engine.checks.execute(check['id'], 'candidate', key=f'error-{code}')
+
+    def test_specialist_top_level_findings_are_retained(self):
+        from coding_agent.tools import WorkerTask
+        proposal = dict(id='draft', title='Draft', claim='Investigate', path='level.hpp')
+        class Provider:
+            def invoke(self, messages, *, role):
+                return json.dumps({'type': 'finish', 'summary': 'Done', 'findings': [proposal]})
+        self.engine.provider = Provider()
+        self.engine.pool.start([WorkerTask(id='draft', task='Review source', paths=['level.hpp'])])
+        self.engine.pool.collect(['draft'])
+        receipts = self.harness.store.receipts(self.rid, 'draft_findings')
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(read_json(self.harness.store, self.rid, receipts[0]['data']['artifact_id'])['findings'][0]['id'], 'draft')
+
+    def test_baseline_resolution_requires_latest_clean_candidate(self):
+        source = self.engine.broker.read_file(ReadArgs(path='level.hpp', baseline=True))
+        bundle, _ = self.bundle()
+        probe = dict(artifact_id='f'*64, defect_id='bound', observation='Wrong bound',
+                     check_id='acceptance', path='level.hpp', phase='baseline',
+                     start_line=1, end_line=1, source_hash=bundle.baseline_hash,
+                     observed_exit_codes=[0], not_observed_exit_codes=[42], check_spec={})
+        bundle.defect_probes = [probe]
+        common = dict(check_id='acceptance', receipt_state='completed', artifact_id='e'*64,
+                      probe_definition_id='f'*64, probe_target_valid=True, probe_range_valid=True)
+        bundle.checks = [{**common, 'phase': 'baseline', 'source_hash': bundle.baseline_hash,
+                          'passed': False, 'exit_code': 0, 'executed_at': 1},
+                         {**common, 'phase': 'candidate', 'source_hash': bundle.candidate_hash,
+                          'passed': True, 'exit_code': 42, 'executed_at': 2}]
+        proposal = dict(id='bound', title='Bound', claim='Wrong', path='level.hpp', phase='baseline',
+                        defect_id='bound', evidence_ids=[source['evidence_id']])
+        for resolved in (True, False):
+            if not resolved:
+                bundle.checks.insert(0, {**bundle.checks[-1], 'passed': False, 'exit_code': 0, 'executed_at': 3})
+            aid = self.harness.store.artifact(self.rid, bundle.model_dump())
+            self.harness.store.event(self.rid, 'evidence_bundle', {'artifact_id': aid})
+            found, _, _ = adjudicate_response(self.harness.store, bundle, aid, {'findings': [proposal]})
+            self.assertEqual(found[0].status, 'reproduced')
+            self.assertEqual(found[0].resolved, resolved)
+
 
 class InvestigationTests(unittest.TestCase):
     def test_new_ranges_overlap_and_revision_refresh(self):
@@ -181,6 +294,23 @@ class InvestigationTests(unittest.TestCase):
             ticks = iter([0, 3])
             scope = discover_scope(workspace, Profile(name='test'), clock=lambda: next(ticks))
             self.assertEqual(scope.limit_reached, 'seconds')
+
+    def test_transitive_discovery_mode_changes_and_cancellation(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            (source/'z.py').write_text('import a\n')
+            (source/'a.py').write_text('import b\n')
+            (source/'b.py').write_text('import c\n')
+            (source/'c.py').write_text('value = 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            (workspace.root/'z.py').chmod(0o755)
+            scope = discover_scope(workspace, Profile(name='test'), implementation=True)
+            self.assertEqual(set(scope.intended_paths), {'z.py', 'a.py', 'b.py', 'c.py'})
+            scope = discover_scope(workspace, Profile(name='test'), cancelled=lambda: True)
+            self.assertEqual(scope.limit_reached, 'cancelled')
+            self.assertTrue(scope.unenumerated_remainder)
 
     def test_drafts_survive_protocol_exhaustion_and_cancellation(self):
         for cancel in (False, True):
@@ -220,6 +350,9 @@ class QualificationTests(unittest.TestCase):
         self.assertFalse(report({'purpose': 'release', 'protocol': [[True]]*100})['observed_gates']['protocol_sample'])
         self.assertIsNone(report({})['metrics']['valid_promotions']['observed'])
         self.assertFalse(report({})['observed_gates_pass'])
+        no_clean = report({'cases': [{'id': 'bug', 'language': 'python', 'expected': ['x']}]})
+        self.assertTrue(no_clean['observed_gates']['zero_unsupported_critical'])
+        self.assertFalse(no_clean['observed_gates']['clean_cases_present'])
 
 
 class TrustedProbeTests(unittest.TestCase):

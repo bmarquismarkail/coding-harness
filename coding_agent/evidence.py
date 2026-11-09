@@ -71,11 +71,19 @@ def reviewer_view(store, bundle, bundle_id, budget=6000):
             if len(view.model_dump_json().encode()) > budget:
                 target.pop()
                 view.omitted_references.append(item.get('artifact_id', item.get('receipt_key', 'unknown')))
-    view.omitted_count = len(view.omitted_references)
-    if view.omitted_references:
-        view.omitted_manifest_id = store.artifact(bundle.run_id, view.omitted_references)
-        while len(view.model_dump_json().encode()) > budget and view.omitted_references:
-            view.omitted_references.pop()
+    omitted = list(view.omitted_references)
+    view.omitted_references = []
+    # The manifest is authoritative; inline references are optional excerpts.
+    while True:
+        view.omitted_count = len(omitted)
+        view.omitted_manifest_id = store.artifact(bundle.run_id, omitted) if omitted else None
+        if len(view.model_dump_json().encode()) <= budget:
+            break
+        category = next((c for c in ('sources', 'defect_probes', 'checks') if getattr(view, c)), None)
+        if category is None:
+            raise ValueError('budget cannot hold evidence view metadata')
+        item = getattr(view, category).pop()
+        omitted.append(item.get('artifact_id', item.get('receipt_key', 'unknown')))
     artifact = store.artifact(bundle.run_id, view.model_dump())
     store.event(bundle.run_id, 'reviewer_view', {'artifact_id': artifact, 'bundle_id': bundle_id})
     return view
@@ -83,17 +91,21 @@ def reviewer_view(store, bundle, bundle_id, budget=6000):
 
 def current_checks(bundle, check_id, phase):
     expected = bundle.baseline_hash if phase == 'baseline' else bundle.candidate_hash
-    return [c for c in bundle.checks if c.get('check_id') == check_id and c.get('phase') == phase
+    return sorted([c for c in bundle.checks if c.get('check_id') == check_id and c.get('phase') == phase
             and c.get('source_hash') == expected and c.get('receipt_state') == 'completed'
-            and c.get('artifact_id') and not c.get('integrity_error')]
+            and c.get('artifact_id') and not c.get('integrity_error')], key=lambda c: c.get('executed_at', 0))
 
 
 def normalize_response(raw):
     """Accept typed responses and legacy reports without silently dropping concerns."""
     if raw.get('review') is not None:
-        return ReviewerResponse.model_validate(raw['review'])
+        response = ReviewerResponse.model_validate(raw['review'])
+        response.semantic_concerns = list(dict.fromkeys([*response.semantic_concerns, *raw.get('gaps', [])]))
+        return response
     if any(k in raw for k in ('challenges', 'observations', 'semantic_concerns')):
-        return ReviewerResponse.model_validate(raw)
+        response = ReviewerResponse.model_validate({k: value for k, value in raw.items() if k != 'gaps'})
+        response.semantic_concerns = list(dict.fromkeys([*response.semantic_concerns, *raw.get('gaps', [])]))
+        return response
     # Legacy empty reports remain valid. Unstructured concerns are retained conservatively.
     return ReviewerResponse(findings=[FindingProposal.model_validate(f) for f in raw.get('findings', [])],
                             semantic_concerns=raw.get('gaps', []))
@@ -139,9 +151,14 @@ def adjudicate_response(store, bundle, bundle_id, raw):
     for proposal in response.findings:
         status, reason, observation = 'hypothesis', 'Source reasoning remains a model proposal.', None
         citations = [s for s in bundle.source_evidence if s['artifact_id'] in proposal.evidence_ids]
-        if len(citations) != len(set(proposal.evidence_ids)) or any(
+        cursor = proposal.start_line
+        for source in sorted(citations, key=lambda s: s['start']):
+            if source['start'] > cursor:
+                break
+            cursor = max(cursor, source['end'] + 1)
+        if (citations and cursor <= proposal.end_line) or len(citations) != len(set(proposal.evidence_ids)) or any(
                 not s['valid'] or s['phase'] != proposal.phase or s['path'] != proposal.path
-                or s['start'] > proposal.start_line or s['end'] < proposal.end_line or s.get('truncated_line')
+                or s.get('truncated_line')
                 for s in citations):
             status, reason = 'needs_human_review', 'Invalid or wrong-snapshot source citation.'
         probe = next((p for p in bundle.defect_probes if p['defect_id'] == proposal.defect_id), None)
@@ -156,15 +173,28 @@ def adjudicate_response(store, bundle, bundle_id, raw):
                      and proposal.end_line == probe['end_line']
                      and record.get('probe_definition_id') == probe['artifact_id']
                      and record.get('probe_target_valid') is True
-                     and all(any(r.get('passed') for r in current_checks(bundle, prerequisite, probe['phase']))
+                     and all(bool(current_checks(bundle, prerequisite, probe['phase']))
+                             and current_checks(bundle, prerequisite, probe['phase'])[-1].get('passed')
                              for prerequisite in probe.get('check_spec', {}).get('requires', []))
                      and not any(record.get(k) for k in ('timed_out', 'cancelled', 'skipped', 'source_modified', 'output_truncated')))
             if not valid or record.get('exit_code') not in probe['observed_exit_codes'] + probe['not_observed_exit_codes']:
                 status, reason = 'needs_human_review', 'Trusted probe execution or target is inconclusive.'
             elif record['exit_code'] in probe['observed_exit_codes'] and status != 'needs_human_review':
                 status, reason, observation = 'reproduced', 'Only the registered observation was reproduced.', probe['observation']
+        resolved = False
+        if probe and proposal.phase == 'baseline' and status == 'reproduced':
+            candidates = current_checks(bundle, probe['check_id'], 'candidate')
+            latest = candidates[-1] if candidates else {}
+            # Only a clean execution of the same trusted oracle on the final
+            # candidate resolves a reproduced baseline observation.
+            resolved = (latest.get('probe_definition_id') == probe['artifact_id']
+                        and latest.get('passed') is True
+                        and latest.get('probe_range_valid') is True
+                        and latest.get('exit_code') in probe['not_observed_exit_codes']
+                        and not any(latest.get(k) for k in ('timed_out', 'cancelled', 'skipped',
+                                                          'source_modified', 'output_truncated')))
         findings.append(AdjudicatedFinding(proposal=proposal, status=status, reason=reason,
-                                           observation=observation, proposal_artifact=proposal_id))
+                                           observation=observation, resolved=resolved, proposal_artifact=proposal_id))
     adjudication_id = store.artifact(bundle.run_id, {'bundle_id': bundle_id, 'proposal_id': proposal_id,
         'decisions': decisions, 'findings': [f.model_dump() for f in findings], 'gaps': gaps})
     store.event(bundle.run_id, 'adjudication', {'artifact_id': adjudication_id})

@@ -103,6 +103,7 @@ class AdjudicatedFinding(Contract):
     status: Literal['hypothesis', 'reproduced', 'needs_human_review'] = 'hypothesis'
     observation: str | None = None
     reason: str
+    resolved: bool = False
     proposal_artifact: str
 
 
