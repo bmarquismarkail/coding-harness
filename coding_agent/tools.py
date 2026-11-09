@@ -16,6 +16,7 @@ from .checks import Checks
 from .sandbox import CommandCancelled
 from .store import Store
 from .types import CheckSpec, Contract
+from .review_types import FindingProposal
 from .workspace import Workspace, checked_path, digest, paths, tree_hash
 from .zvec import ZvecGrepTool, ZvecGrepError
 
@@ -93,6 +94,10 @@ class CollectArgs(Contract):
     ids: list[str] = Field(min_length=1, max_length=9)
 
 
+class ReportFindingsArgs(Contract):
+    findings: list[FindingProposal] = Field(default_factory=list, max_length=30)
+
+
 class EmptyArgs(Contract):
     pass
 
@@ -100,7 +105,7 @@ class EmptyArgs(Contract):
 READ_TOOLS = {"list_files": ListArgs, "read_file": ReadArgs, "search_exact": SearchArgs,
               "search_semantic": SearchArgs, "read_evidence": EvidenceArgs, "read_artifact": ArtifactArgs,
               "list_checks": PageArgs, "inspect_diff": EmptyArgs}
-WRITE_TOOLS = {"apply_patch": PatchArgs, "run_command": CommandArgs, "run_check": CheckArgs,
+WRITE_TOOLS = {"report_findings": ReportFindingsArgs, "apply_patch": PatchArgs, "run_command": CommandArgs, "run_check": CheckArgs,
                "register_check": RegisterArgs, "delegate": DelegateArgs, "collect": CollectArgs}
 
 
@@ -118,6 +123,7 @@ class ToolBroker:
             allowed.update(WRITE_TOOLS)
             if self.mode == "review":
                 allowed.pop("apply_patch")
+        allowed["report_findings"] = ReportFindingsArgs
         descriptions = {
             "apply_patch": "Create, replace, or delete files. Read existing files first and supply their sha256 as expected_hash; use null only for new files. Preserve the original tests.",
             "run_check": "Execute a registered check on baseline or candidate sources; use this rather than run_command for acceptance evidence.",
@@ -145,6 +151,11 @@ class ToolBroker:
         if len(raw) > 8000:
             return {"artifact_id": artifact, "preview": raw[:6000], "truncated": True}
         return {"artifact_id": artifact, "result": result}
+
+    def report_findings(self, args: ReportFindingsArgs, *, key):
+        artifact = self.store.artifact(self.run_id, args.model_dump())
+        self.store.save_receipt(self.run_id, key, "draft_findings", "completed", {"artifact_id": artifact})
+        return {"saved": len(args.findings), "artifact_id": artifact}
 
     def _path(self, relative: str, baseline=False):
         scope = self.scope
@@ -244,6 +255,13 @@ class ToolBroker:
 
     def list_checks(self, args: PageArgs, **_):
         definitions = self.checks.definitions()
+        from .evidence import read_json
+        probes = [read_json(self.store, self.run_id, receipt['data']['artifact_id'])
+                  for receipt in self.store.receipts(self.run_id, 'probe_definition')]
+        for definition in definitions:
+            definition['trusted_observations'] = [
+                {k: p[k] for k in ('defect_id', 'observation', 'path', 'start_line', 'end_line', 'phase', 'source_hash')}
+                for p in probes if p['check_id'] == definition['spec']['id']]
         return {"checks": definitions[args.offset:args.offset+args.limit], "total": len(definitions),
                 "has_more": args.offset+args.limit<len(definitions), "next_offset": args.offset+args.limit}
 

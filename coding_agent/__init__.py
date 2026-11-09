@@ -11,3 +11,9 @@ __all__ = [
     "create_graph", "load_config", "run_agent", "zvec_grep_tool",
     "Harness", "TaskRequest", "RunResult", "RunStatus", "CheckSpec", "Profile", "EvidencePackage",
 ]
+
+from .review_types import (DefectProbeSpec, FindingProposal, ReviewDetails,
+                           ImmutableEvidenceBundle, ReviewerEvidenceView, ReviewerResponse)
+
+__all__ += ["DefectProbeSpec", "FindingProposal", "ReviewDetails", "ImmutableEvidenceBundle",
+            "ReviewerEvidenceView", "ReviewerResponse"]

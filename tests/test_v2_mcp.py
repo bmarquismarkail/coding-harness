@@ -132,6 +132,7 @@ class MCPAcceptance(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status.state,"completed",status.error)
             result=await self.call(client,"result",run_id=run_id)
             self.assertEqual(result["outcome"],"unverified")
+            self.assertEqual(result["review"], self.harness.result(run_id).review.model_dump())
             self.assertNotIn("patch",result)
             artifact=await self.call(client,"artifact",run_id=run_id,artifact_id=result["patch_artifact"],limit=1)
             self.assertEqual(artifact["content"],"")

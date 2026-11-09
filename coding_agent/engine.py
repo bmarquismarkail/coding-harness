@@ -14,6 +14,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from .checks import Checks
+from .evidence import freeze_bundle, reviewer_view, adjudicate_response, read_json
+from .review_types import ReviewDetails, Coverage, ReviewerResponse, FindingProposal
+from .investigation import discover_scope, evidence_progress
 from .config import AgentConfig
 from .profiles import configured_models
 from .project_profiles import skill_context, skill_metadata
@@ -36,6 +39,9 @@ class LoopState(TypedDict, total=False):
     action: dict
     result: dict
     reads_since_edit: int
+    protocol_failures: int
+    progress_ledger: dict
+    partial_reasons: list[str]
     final_attempts: int
     forced_finish: bool
 
@@ -73,6 +79,9 @@ def instructions(broker: ToolBroker, specialist=False, skills=None) -> str:
         "New test files can be frozen with register_check before running them against both baseline and candidate. "
         "Delegate only focused questions with explicit paths; collect specialists before editing or running code. "
         "Finish when the requested patch is ready, not after planning alone. Final checks and a fresh review run automatically. "
+        "Findings require id,title,claim,path,start_line,end_line,phase and evidence_ids. "
+        "Use report_findings to retain draft findings before further investigation. "
+        "Use list_checks to inspect caller-configured trusted observations and their defect_id values. "
         "Findings without independent reproduction remain hypotheses. Keep observations concise. "
         "At finish, include diagnosis and diagnosis_sources using evidence IDs returned by read_file or read_evidence. "
         "A diagnosis citation is a source reference, not proof that a check passed.\nPROJECT SKILLS (read-only guidance):\n"
@@ -167,13 +176,27 @@ class SpecialistPool:
                     action = parse_action(raw)
                     if isinstance(action, FinishAction):
                         data["result"] = {"id": task.id, **action.model_dump(), "source_hash": data["source_hash"]}
+                        drafts = list(action.review.findings) if action.review else []
+                        for item in action.findings:
+                            try:
+                                drafts.append(FindingProposal.model_validate(item))
+                            except ValueError:
+                                continue
+                        if drafts:
+                            artifact = e.store.artifact(e.run_id, {"findings": [f.model_dump() for f in drafts]})
+                            e.store.save_receipt(e.run_id, "specialist:" + key, "draft_findings", "completed", {"artifact_id": artifact})
                         self.save(key, "completed", data)
                         return data["result"]
                     if not isinstance(action, ToolAction):
                         raise ValueError("specialists must finish or use their read-only tools")
                     result = broker.invoke(action.tool, action.args, key=f"worker:{key}:{data['step']}")
+                    data["protocol_failures"] = 0
                 except (ValueError, PermissionError, OSError) as exc:
                     result = {"error": str(exc)}
+                    data["protocol_failures"] = data.get("protocol_failures", 0) + 1
+                if data.get("protocol_failures", 0) >= e.profile.protocol_failure_limit:
+                    self.save(key, "running", data)
+                    raise SpecialistFailure("specialist protocol recovery exhausted")
                 data["messages"].append({"role": "user", "content": json.dumps(result)})
                 self.save(key, "running", data)
             raise SpecialistFailure("specialist action budget exhausted")
@@ -236,6 +259,11 @@ class Engine:
         self.broker = ToolBroker(store, run_id, self.workspace, self.checks, mode=self.request.mode, zvec=self.zvec)
         self.pool = SpecialistPool(self)
         self.broker.pool = self.pool
+        self.coverage = Coverage()
+        self.bundle = None
+        self.bundle_id = None
+        self.review_findings = []
+        self.adjudication_ids = []
 
     def cancelled(self):
         if self.stop.is_set():
@@ -284,15 +312,22 @@ class Engine:
             self.guard()
             raw = self.provider.invoke(bounded_messages(state["messages"], self.profile.main_context_bytes), role="main")
             messages = [*state["messages"], {"role": "assistant", "content": raw}]
+            failures = state.get("protocol_failures", 0)
             try:
                 action = parse_action(raw).model_dump()
             except ValueError as exc:
+                failures += 1
                 action = {"type": "invalid"}
                 messages.append({"role": "user", "content": f"Invalid action: {str(exc)[:1200]}. "
                                  'Use {"type":"tool","tool":"read_file","args":{"path":"your_file"}} for a tool. '
                                  'Use {"type":"finish","summary":"...","findings":[],"gaps":[]} only after completing work. '
                                  'Every finding must be an object, for example {"title":"hypothesis"}.'})
-            return {"messages": messages, "action": action, "step": state["step"]+1}
+            if failures >= self.profile.protocol_failure_limit:
+                return {"messages": messages, "action": {"type": "finish", "summary": "Protocol recovery exhausted.",
+                        "gaps": ["Protocol recovery exhausted."]}, "step": state["step"]+1,
+                        "protocol_failures": failures, "partial_reasons": ["protocol_failure"]}
+            return {"messages": messages, "action": action, "step": state["step"]+1,
+                    "protocol_failures": failures if action["type"] in {"invalid", "tool"} else 0}
 
         def tool(state):
             self.guard()
@@ -306,62 +341,85 @@ class Engine:
                     observation = self.broker.invoke(action.tool, action.args, key=key)
                 except (ValueError, PermissionError, FileNotFoundError) as exc:
                     observation = {"error": str(exc)}
-            streak = state.get("reads_since_edit", 0)+1
-            if isinstance(action, ToolAction) and action.tool in {"apply_patch", "run_check", "register_check"}:
-                streak = 0
+            ledger, progressed = evidence_progress(state.get("progress_ledger", {}), observation, self.coverage.intended_paths)
+            if isinstance(action, ToolAction) and action.tool == "apply_patch" and "error" not in observation:
+                for change in action.args.get('changes', []):
+                    if change.get('expected_hash') is None and change.get('content') is not None:
+                        if change['path'] not in self.coverage.intended_paths:
+                            self.coverage.intended_paths.append(change['path'])
+                patch_id = self.store.artifact(self.run_id, self.workspace.patch())
+                progressed = patch_id != ledger.get("patch")
+                ledger["patch"] = patch_id
+            streak = 0 if progressed else state.get("reads_since_edit", 0) + 1
+            failures = state.get("protocol_failures", 0) + 1 if "error" in observation else 0
+            updates = {"messages": [*state["messages"], {"role": "user", "content": json.dumps(observation)}],
+                       "reads_since_edit": streak, "progress_ledger": ledger, "protocol_failures": failures}
             if streak >= 6:
-                observation["workflow_reminder"] = (
-                    "Several investigation actions have run without progress. "
-                    + ("Use the gathered evidence to implement the requested repair with apply_patch, then run_check. "
-                       if self.request.mode == "implement" else
-                       "Complete the review now. If a requested path is absent or evidence is insufficient, finish with a gap; do not repeat the same read. ")
-                    + "Baseline execution results and tool errors are retained. Repeated source reads do not complete the task.")
-            if streak >= self.profile.review_no_progress_actions:
-                observation["no_progress_boundary"] = (
-                    "The bounded investigation budget has been reached. The next action must be finish, with concrete findings "
-                    "and gaps for anything not established; further repeated reads are rejected.")
-                if self.request.mode == "review":
-                    return {"messages": [*state["messages"], {"role": "user", "content": json.dumps(observation)}],
-                            "reads_since_edit": streak,
-                            "forced_finish": True,
-                            "action": {"type": "finish", "summary": "Review stopped at the bounded no-progress boundary.",
-                                        "findings": [], "gaps": ["The model repeated investigation without establishing sufficient evidence."]}}
-            return {"messages": [*state["messages"], {"role": "user", "content": json.dumps(observation)}],
-                    "reads_since_edit": streak}
+                updates["messages"].append({"role": "user", "content": "No new scoped evidence. Resolve the task or finish with explicit gaps."})
+            reason = None
+            if failures >= self.profile.protocol_failure_limit:
+                reason = "protocol_failure"
+            elif streak >= self.profile.review_no_progress_actions:
+                reason = "investigation_incomplete"
+            if reason:
+                updates.update(forced_finish=True, partial_reasons=[reason], action={"type": "finish",
+                    "summary": "Investigation stopped at a bounded recovery boundary.", "gaps": [reason]})
+            return updates
 
         def finalize(state):
-            self.pool.collect_all()
             action = FinishAction.model_validate(state["action"])
-            review_findings, review_gaps = [], []
+            if action.review and action.review.findings:
+                artifact = self.store.artifact(self.run_id, {"findings": [f.model_dump() for f in action.review.findings]})
+                self.store.save_receipt(self.run_id, f"finish:{self.revision}:{state['step']}", "draft_findings", "completed", {"artifact_id": artifact})
+            self.pool.collect_all()
+            review_gaps = []
             if self.request.mode == "implement":
                 final_key = f"final:{self.revision}:{state.get('final_attempts', 0)}"
                 self.checks.run_all("baseline", final_key+":baseline")
                 self.checks.run_all("candidate", final_key+":candidate")
-                changed = [relative for relative, path in paths(self.workspace.root)
-                           if digest_local(path) != digest_local(self.workspace.baseline/relative)]
-                if changed and self.profile.max_specialists:
-                    review = WorkerTask(id="final-review", paths=changed[:20], task=(
-                        "Review this candidate patch against the baseline. Use inspect_diff; read baseline files with baseline=true as needed. "
-                        "Return findings ONLY for concrete source defects, never general observations that a file changed or a check passed. "
-                        "The following checks were actually executed independently by the harness, not asserted by the writer. "
-                        "You are read-only and need not personally rerun them. Do not call existing successful checks missing. "
-                        "Identify specific uncovered regressions; otherwise return findings=[] and gaps=[]. "
-                        "Executed checks: "
-                        + json.dumps([{k:r['data'].get(k) for k in ('check_id','phase','passed','artifact_id')}
-                                      for r in self.store.receipts(self.run_id, 'check')])[-3000:]))
+            self.coverage = discover_scope(self.workspace, self.profile, self.request.focus_paths,
+                                           implementation=self.request.mode == "implement", cancelled=self.cancelled)
+            self.bundle, self.bundle_id = freeze_bundle(self, self.coverage)
+            self.review_findings = []
+            self.adjudication_ids = []
+            if self.request.mode == "implement" and self.profile.max_specialists:
+                targets = self.coverage.intended_paths
+                for offset in range(0, len(targets), 20):
+                    view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=2400)
+                    task_prefix = (
+                        "Review candidate and baseline. Return a finish action with review containing findings, observations, "
+                        "challenges, semantic_concerns. Findings require id,title,claim,path,start_line,end_line,phase. "
+                        "For missing execution evidence use challenges [{kind:check_missing,check_id:ID,phase:candidate}]. "
+                        "No defect found is an observation. Authoritative evidence view: ")
+                    rendered = task_prefix + json.dumps({
+                        "view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()}, ensure_ascii=False, separators=(",", ":"))
+                    if len(rendered) > 4000:
+                        view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=400)
+                        rendered = task_prefix + json.dumps({
+                            "view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()},
+                            ensure_ascii=False, separators=(",", ":"))
+                    review = WorkerTask(id=f"final-review-{offset}", paths=targets[offset:offset+20], task=rendered)
                     self.pool.start([review])
                     report = self.pool.collect([review.id])
-                    self.store.event(self.run_id, "independent_review", {"artifact_id": self.store.artifact(self.run_id, report)})
+                    self.bundle, self.bundle_id = freeze_bundle(self, self.coverage)
                     for item in report["results"]:
-                        review_findings.extend(item.get("findings", []))
-                        review_gaps.extend(item.get("gaps", []))
-                    if review_findings:
-                        review_gaps.append("Final review raised hypotheses that still require independent resolution.")
-            gaps = [*action.gaps, *review_gaps]
-            findings = [*action.findings, *review_findings]
-            independent_findings, independent_gaps = self.independent_review(action.summary, findings, gaps)
-            findings.extend(independent_findings)
+                        _, item_gaps = self.evaluate_review(item)
+                        review_gaps.extend(item_gaps)
+            gaps = [*action.gaps, *review_gaps, *self.bundle.integrity_gaps]
+            findings = list(action.findings)
+            draft = []
+            for receipt in self.store.receipts(self.run_id, "draft_findings"):
+                draft.extend(read_json(self.store, self.run_id, receipt["data"]["artifact_id"])["findings"])
+            proposed = action.review.model_dump() if action.review else {"findings": action.findings}
+            proposed["findings"] = [*draft, *proposed["findings"], *(action.findings if action.review else [])]
+            if proposed.get("findings") or action.review:
+                _, proposal_gaps = self.evaluate_review(proposed)
+                gaps.extend(proposal_gaps)
+            _, independent_gaps = self.independent_review(action.summary, [f.proposal.model_dump() for f in self.review_findings], gaps)
             gaps.extend(independent_gaps)
+            findings = [f.proposal.model_dump() for f in self.review_findings] + [f for f in findings if "claim" not in f]
+            if self.request.mode == "implement" and any(not f.resolved for f in self.review_findings):
+                gaps.append("Concrete review findings require resolution.")
             for finding in findings:
                 for evidence_id in finding.get("evidence_ids", []):
                     try:
@@ -377,6 +435,17 @@ class Engine:
                                         diagnosis=action.diagnosis or action.summary,
                                         diagnosis_sources=action.diagnosis_sources,
                                         skill_snapshots=self.skill_snapshots)
+            reasons = list(state.get("partial_reasons", []))
+            if any(g.startswith(("Invalid reviewer response", "Independent reviewer unavailable")) for g in gaps):
+                reasons.append("protocol_failure")
+            if self.coverage.limit_reached:
+                reasons.append("scope_limit")
+            result.review = ReviewDetails(completion="partial" if reasons else "completed", partial_reasons=reasons,
+                findings=self.review_findings, bundle_id=self.bundle_id, coverage=self.coverage,
+                adjudication_id=self.store.artifact(self.run_id, {"decisions": self.adjudication_ids}))
+            if reasons and result.outcome == "verified":
+                result.outcome = "unverified"
+                result.gaps.extend(reasons)
             attempts = state.get("final_attempts", 0)+1
             # A premature finish with failed checks returns evidence to the writer.
             # This is bounded and checkpointed, never an automatic success upgrade.
@@ -388,7 +457,7 @@ class Engine:
                             "gaps": result.gaps, "failed_checks": [{k:v for k,v in c.items() if k != "output"} for c in failed_checks[-5:]],
                             "outputs": [c.get("output", "")[-1800:] for c in failed_checks[-3:]]}
                 self.store.event(self.run_id, "repair_feedback", {"artifact_id": self.store.artifact(self.run_id, feedback)})
-                return {"final_attempts": attempts, "messages": [*state["messages"], {"role":"user", "content":json.dumps(feedback)}]}
+                return {"forced_finish": False, "final_attempts": attempts, "messages": [*state["messages"], {"role":"user", "content":json.dumps(feedback)}]}
             return {"result": result.model_dump(), "final_attempts": attempts}
 
         builder = StateGraph(LoopState)
@@ -401,30 +470,33 @@ class Engine:
         builder.add_conditional_edges("finalize", lambda s: END if s.get("result") else "model")
         return builder.compile(checkpointer=saver)
 
+    def evaluate_review(self, raw):
+        try:
+            findings, gaps, artifact = adjudicate_response(self.store, self.bundle, self.bundle_id, raw)
+            existing = {f.proposal.model_dump_json() for f in self.review_findings}
+            for finding in findings:
+                key = finding.proposal.model_dump_json()
+                if key not in existing:
+                    self.review_findings.append(finding)
+                    existing.add(key)
+            self.adjudication_ids.append(artifact)
+            return findings, gaps
+        except (ValueError, OSError, TypeError) as exc:
+            self.store.event(self.run_id, "review_protocol_failure", {"artifact_id": self.store.artifact(self.run_id, raw)})
+            return [], [f"Invalid reviewer response: {exc}"]
+
     def independent_review(self, summary: str, findings: list[dict], gaps: list[str]) -> tuple[list[dict], list[str]]:
-        """Have a separately routed model challenge the writer's conclusions."""
-        prompt = [{"role": "system", "content": (
-            "You are an independent evidence reviewer. You do not edit, execute, delegate, or add new claims. "
-            "Review only the conclusions supplied by another model. Return exactly one JSON object with keys "
-            "verdict, findings, and gaps; findings are for unsupported or overstated conclusions and gaps are for missing evidence. "
-            "Treat every finding as a hypothesis unless the supplied evidence directly supports it."
-        )}, {"role": "user", "content": json.dumps({
-            "task": self.request.task, "summary": summary, "findings": findings, "gaps": gaps,
-            "project_profile": self.request.project_profile, "skills": self.skill_snapshots
-        }, ensure_ascii=False)}]
+        view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=self.profile.worker_context_bytes // 2)
+        prompt = [{"role": "system", "content": "Challenge conclusions using authoritative evidence. Return JSON matching "
+                   + json.dumps(ReviewerResponse.model_json_schema())},
+                  {"role": "user", "content": json.dumps({"task": self.request.task, "summary": summary,
+                    "findings": findings, "gaps": gaps, "evidence_view": {"view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()}})}]
+        request_id = self.store.artifact(self.run_id, prompt)
         try:
             raw = self.provider.invoke(prompt, role="reviewer")
-            verdict = json.loads(raw)
-            if not isinstance(verdict, dict):
-                raise ValueError("independent reviewer returned a non-object verdict")
-            reviewer_findings = verdict.get("findings", [])
-            reviewer_gaps = verdict.get("gaps", [])
-            if not isinstance(reviewer_findings, list) or not isinstance(reviewer_gaps, list):
-                raise ValueError("independent reviewer verdict requires findings and gaps arrays")
-            artifact = self.store.artifact(self.run_id, {"role": "reviewer", "response": raw})
-            self.store.event(self.run_id, "independent_model_review", {
-                "artifact_id": artifact, "verdict": verdict.get("verdict", "unclassified")})
-            return reviewer_findings, [str(gap) for gap in reviewer_gaps]
+            response_id = self.store.artifact(self.run_id, raw)
+            self.store.event(self.run_id, "independent_model_review", {"request_artifact": request_id, "response_artifact": response_id})
+            return self.evaluate_review(json.loads(raw))
         except Exception as exc:
             message = f"Independent reviewer unavailable: {type(exc).__name__}: {exc}"
             self.store.event(self.run_id, "independent_model_review_failed", {"error": message[:1000]})
@@ -435,6 +507,7 @@ class Engine:
             self.workspace.prepare(Path(self.request.root))
             self.checks.initialize(self.request)
             self.pool.reconcile()
+            self.coverage = discover_scope(self.workspace, self.profile, self.request.focus_paths, cancelled=self.cancelled)
             # Read instruction/build metadata before any project execution.
             self.seed(self.broker)
             self.store.transition(self.run_id, "running")
@@ -498,7 +571,23 @@ class Engine:
                                   patch_artifact=self.store.artifact(self.run_id, patch), patch_source_hash=current_hash,
                                   verification_checks=verification, remaining_gaps=["Execution stopped before the workflow and verification completed."],
                                   skill_snapshots=self.skill_snapshots)
+        partial_findings = []
+        bundle_id = None
+        partial_errors = []
+        if (self.workspace.folder / "workspace.json").exists() and self.checks.path.exists():
+            try:
+                bundle, bundle_id = freeze_bundle(self, self.coverage)
+                for receipt in self.store.receipts(self.run_id, "draft_findings"):
+                    raw = read_json(self.store, self.run_id, receipt["data"]["artifact_id"])
+                    found, _, _ = adjudicate_response(self.store, bundle, bundle_id, raw)
+                    partial_findings.extend(found)
+            except (ValueError, OSError, KeyError) as exc:
+                partial_errors.append(f"Partial evidence could not be adjudicated: {exc}")
+        package.remaining_gaps.extend(partial_errors)
+        partial_reason = "budget_exhausted" if "budget" in reason else "interrupted"
         return RunResult(run_id=self.run_id, outcome=outcome, summary=reason, patch=patch,
+                         review=ReviewDetails(completion="partial", partial_reasons=[partial_reason],
+                             findings=partial_findings, bundle_id=bundle_id, coverage=self.coverage),
                          patch_artifact=self.store.artifact(self.run_id, patch),
                          checks=[{k:v for k,v in c.items() if k != "output"} for c in checks],
                          evidence_ids=sorted({c["artifact_id"] for c in checks if c.get("artifact_id")}),

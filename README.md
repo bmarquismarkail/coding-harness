@@ -113,3 +113,5 @@ request timings, graph state, and `report.json` under
 `development-evidence/live-model-smoke-*`. The test does not create a search
 index or execute model-proposed shell commands. Normal test discovery skips it
 unless `RUN_LIVE_MODEL_TESTS=1` is set.
+
+See [v0.3 evidence and review contracts](docs/v0.3.md) for trusted probes, partial reviews, and provider-free qualification.

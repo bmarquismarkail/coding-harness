@@ -19,9 +19,9 @@ from .types import TaskRequest
 def create_server(harness: Harness) -> MCPServer:
     if not harness.allowed_roots:
         raise ValueError("MCP requires explicitly configured allowed repository roots")
-    server = MCPServer("coding_agent_mcp", version="0.2.0", instructions=(
+    server = MCPServer("coding_agent_mcp", version="0.3.0", instructions=(
         "Submit an isolated coding/review job, poll status/events, and retrieve its result and patch artifact. "
-        "Only outcome=verified establishes completion. Model findings may remain hypotheses. "
+        "Implementation acceptance requires outcome=verified. Review process completion is reported in review.completion. Model findings may remain hypotheses. "
         "Jobs survive this MCP connection; cancel explicitly to stop them."))
 
     def tool(name, read=True):

@@ -1,0 +1,561 @@
+{
+  "original_run_id": "83deda321c654343846a65a47722e1b6",
+  "original_directory": "/home/brandon/.local/state/coding-agent-acceptance/cpp-8uqnat7r/runtime/runs/83deda321c654343846a65a47722e1b6",
+  "baseline_commit": "86a75251b1ad64a698926ac623d1dcc58d5be680",
+  "review_artifact": "c729a5d82f112d49c24163ead009dbf45f02118afed1ca6596398e8228a792b8",
+  "request": {
+    "root": "FIXTURE",
+    "task": "Repair clamp_level for levels above 100; retain existing behavior otherwise.",
+    "mode": "implement",
+    "task_type": "bugfix",
+    "profile": "live-acceptance",
+    "checks": [
+      {
+        "id": "build-acceptance",
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/acceptance.cpp",
+          "-o",
+          "build-acceptance"
+        ],
+        "cwd": ".",
+        "kind": "build",
+        "timeout_seconds": 600,
+        "requires": []
+      },
+      {
+        "id": "acceptance",
+        "argv": [
+          "./build-acceptance"
+        ],
+        "cwd": ".",
+        "kind": "acceptance",
+        "timeout_seconds": 600,
+        "requires": [
+          "build-acceptance"
+        ]
+      },
+      {
+        "id": "build-regression",
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/regression.cpp",
+          "-o",
+          "build-regression"
+        ],
+        "cwd": ".",
+        "kind": "build",
+        "timeout_seconds": 600,
+        "requires": []
+      },
+      {
+        "id": "regression",
+        "argv": [
+          "./build-regression"
+        ],
+        "cwd": ".",
+        "kind": "regression",
+        "timeout_seconds": 600,
+        "requires": [
+          "build-regression"
+        ]
+      }
+    ],
+    "readonly_dependencies": []
+  },
+  "receipts": [
+    {
+      "key": "final:0:baseline:acceptance",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 1,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.054,
+        "check_id": "acceptance",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": false,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "4d6a89201e581b87999d281d48a880f8d194b74455fe23e5cb305f7c8cb0e1e7"
+      }
+    },
+    {
+      "key": "final:0:baseline:build-acceptance",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/acceptance.cpp",
+          "-o",
+          "build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.155,
+        "check_id": "build-acceptance",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "5d4a4a456bdffe7efc763a0a1235deaf2f37327ff5b32e4e4d8f11a01fdf9823"
+      }
+    },
+    {
+      "key": "final:0:baseline:build-regression",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/regression.cpp",
+          "-o",
+          "build-regression"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.155,
+        "check_id": "build-regression",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "f099a15810da417621bb18dd9df22c5d0619098cdff0bbcd3dd2b3d3e0d21ba5"
+      }
+    },
+    {
+      "key": "final:0:baseline:regression",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-regression"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.053,
+        "check_id": "regression",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "9f92e2646c98caaaa82834068755b094f20051e70eb44e74c413c6b0333c7e48"
+      }
+    },
+    {
+      "key": "final:0:candidate:acceptance",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.051,
+        "check_id": "acceptance",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "51ffd1ced529c1d542b930c7ff346d0482e37bca96a1d76e96276eaa140ee67e"
+      }
+    },
+    {
+      "key": "final:0:candidate:build-acceptance",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/acceptance.cpp",
+          "-o",
+          "build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.155,
+        "check_id": "build-acceptance",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "d72a66e89df04a7aa3f3af95c2f5d0d93aa49696b9d60229ba957241be93d979"
+      }
+    },
+    {
+      "key": "final:0:candidate:build-regression",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/regression.cpp",
+          "-o",
+          "build-regression"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.156,
+        "check_id": "build-regression",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "595c1a19a232e802df65d0a86ddcecbbab91381c7b48e2662ead4b8a252c3620"
+      }
+    },
+    {
+      "key": "final:0:candidate:regression",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-regression"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.054,
+        "check_id": "regression",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "f51df1e787b156513ec7c3a602da7399dfecd7758c9b5581522af8b057a6b21e"
+      }
+    },
+    {
+      "key": "initial:baseline:acceptance",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 1,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.061,
+        "check_id": "acceptance",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": false,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "800418abc0a37dd78cd7e69ed194351adec283d3734b9f2f865156c81140d58d"
+      }
+    },
+    {
+      "key": "initial:baseline:build-acceptance",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/acceptance.cpp",
+          "-o",
+          "build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.154,
+        "check_id": "build-acceptance",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "6fda60524dcf4a70d2179d68c3e449a616610e9b5b821d625e2cb5314458b4bc"
+      }
+    },
+    {
+      "key": "initial:baseline:build-regression",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/regression.cpp",
+          "-o",
+          "build-regression"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.155,
+        "check_id": "build-regression",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "f099a15810da417621bb18dd9df22c5d0619098cdff0bbcd3dd2b3d3e0d21ba5"
+      }
+    },
+    {
+      "key": "initial:baseline:regression",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-regression"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.053,
+        "check_id": "regression",
+        "phase": "baseline",
+        "source_hash": "807d210e6603c3d0e26abe873693d3917c45ae2f867764ce95fd91245d8caea1",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "9f92e2646c98caaaa82834068755b094f20051e70eb44e74c413c6b0333c7e48"
+      }
+    },
+    {
+      "key": "r0:step:11",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "check_id": "acceptance",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "passed": false,
+        "skipped": true,
+        "reason": "prerequisite build-acceptance has not passed on these sources"
+      }
+    },
+    {
+      "key": "r0:step:12",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/acceptance.cpp",
+          "-o",
+          "build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.156,
+        "check_id": "build-acceptance",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "9291f5c730c1a41c1625aa0088a4cd0f044a0aab7fabc9cca880e58c16391bb2"
+      }
+    },
+    {
+      "key": "r0:step:13",
+      "kind": "check",
+      "state": "completed",
+      "data": {
+        "argv": [
+          "./build-acceptance"
+        ],
+        "cwd": ".",
+        "exit_code": 0,
+        "timed_out": false,
+        "output": "",
+        "output_truncated": false,
+        "elapsed_seconds": 0.051,
+        "check_id": "acceptance",
+        "phase": "candidate",
+        "source_hash": "fd1b980406608e886d5c4544829ac222a2ad1b7b292c58ae4ca50c8b7d96caaf",
+        "origin": "request",
+        "passed": true,
+        "source_modified": false,
+        "skipped": false,
+        "artifact_id": "51ffd1ced529c1d542b930c7ff346d0482e37bca96a1d76e96276eaa140ee67e"
+      }
+    }
+  ],
+  "definitions": [
+    {
+      "spec": {
+        "id": "build-acceptance",
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/acceptance.cpp",
+          "-o",
+          "build-acceptance"
+        ],
+        "cwd": ".",
+        "kind": "build",
+        "timeout_seconds": 600.0,
+        "requires": []
+      },
+      "origin": "request",
+      "oracle": {}
+    },
+    {
+      "spec": {
+        "id": "acceptance",
+        "argv": [
+          "./build-acceptance"
+        ],
+        "cwd": ".",
+        "kind": "acceptance",
+        "timeout_seconds": 600.0,
+        "requires": [
+          "build-acceptance"
+        ]
+      },
+      "origin": "request",
+      "oracle": {}
+    },
+    {
+      "spec": {
+        "id": "build-regression",
+        "argv": [
+          "g++",
+          "-std=c++17",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I.",
+          "tests/regression.cpp",
+          "-o",
+          "build-regression"
+        ],
+        "cwd": ".",
+        "kind": "build",
+        "timeout_seconds": 600.0,
+        "requires": []
+      },
+      "origin": "request",
+      "oracle": {}
+    },
+    {
+      "spec": {
+        "id": "regression",
+        "argv": [
+          "./build-regression"
+        ],
+        "cwd": ".",
+        "kind": "regression",
+        "timeout_seconds": 600.0,
+        "requires": [
+          "build-regression"
+        ]
+      },
+      "origin": "request",
+      "oracle": {}
+    }
+  ]
+}

@@ -72,6 +72,13 @@ class Harness:
         frozen_config["_skill_metadata"] = skill_metadata(skills)
         with self.store.queue_lock():
             run_id = self.store.create(request.model_dump(), frozen_config, profile.model_dump())
+            for probe in request.defect_probes:
+                definition = probe.model_dump()
+                definition["check_spec"] = next(c.model_dump() for c in request.checks if c.id == probe.check_id)
+                definition["wrapper_artifact"] = self.store.artifact(run_id, probe.wrapper)
+                definition_id = self.store.artifact(run_id, definition)
+                self.store.save_receipt(run_id, "probe:" + probe.defect_id, "probe_definition", "completed",
+                                        {"artifact_id": definition_id})
             if self.autostart:
                 self._start_supervisor()
         return run_id
