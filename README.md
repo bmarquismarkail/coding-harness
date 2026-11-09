@@ -6,26 +6,26 @@ See **[the v0.2 guide](docs/v0.2.md)** for setup, commands, profiles, isolation,
 verification rules, and live acceptance. The source checkout stays intact;
 results return patches for review. A completed workflow can remain unverified.
 
-Quick start with the existing environment and `LLAMA_API_KEY`:
+Install the package into an active virtual environment with `python -m pip install -e .`. Configure your model endpoints and names as described below, then run a job:
 
 ```bash
-/home/user/python-venv/langchain-suite/bin/python -m coding_agent.cli run \
+python -m coding_agent.cli run \
   --wait --root /path/to/project --checks acceptance-checks.json 'Repair the bug'
 ```
 
 The following sections document the preserved **legacy read-only interface**.
 
-This repository contains a configurable coding-agent graph for OpenAI-compatible llama-server instances. It uses one lead model at `https://lead.example.invalid/v1` and a separate subagent model at `https://specialist.example.invalid/v1`. The default graph launches nine specialist branches in parallel, then asks the lead model to reconcile their evidence.
+This repository contains a configurable coding-agent graph for OpenAI-compatible llama-server instances. It uses separate endpoints for the lead and specialist models. The default graph launches nine specialist branches in parallel, then asks the lead model to reconcile their evidence.
 
-The default configuration is in [agent-config.json](agent-config.json). It contains model names and endpoint locations, but no credential. Set `LLAMA_API_KEY` when the llama-server instances require authentication; the adapter sends it as a Bearer token. Completed conclusions are also sent to a separate, read-only independent reviewer model. Its default endpoint is OpenAI's `https://api.openai.com/v1`, using `gpt-4.1-mini` and `OPENAI_API_KEY`; override it with `REVIEWER_BASE_URL`, `REVIEWER_MODEL`, and `REVIEWER_API_KEY_ENV` or the `reviewer` config record. Main, specialist, and reviewer endpoints must be distinct. The URL must include `http://` or `https://`; the adapter appends `/chat/completions` to each configured base URL. If the reverse proxy is plain HTTP, set `MAIN_BASE_URL=http://lead.example.invalid/v1` and `SUBAGENT_BASE_URL=http://specialist.example.invalid/v1` (or edit the JSON file).
+[agent-config.json](agent-config.json) ships with reserved `.invalid` placeholders for the lead and specialist endpoints. Set `MAIN_BASE_URL`, `MAIN_MODEL`, `SUBAGENT_BASE_URL`, and `SUBAGENT_MODEL` before making model calls, or copy the file to the Git-ignored `agent-config.local.json` and pass it with `--config`. Set `LLAMA_API_KEY` when the llama-server instances require authentication; the adapter sends it as a Bearer token. Completed conclusions are also sent to a separate, read-only independent reviewer model. Its default endpoint is OpenAI's `https://api.openai.com/v1`, using `gpt-4.1-mini` and `OPENAI_API_KEY`; override it with `REVIEWER_BASE_URL`, `REVIEWER_MODEL`, and `REVIEWER_API_KEY_ENV` or the `reviewer` config record. Main, specialist, and reviewer endpoints must be distinct. The URL must include `http://` or `https://`; the adapter appends `/chat/completions` to each configured base URL.
 
 ## Run
 
-Use the requested environment:
+With your virtual environment active:
 
 ```bash
-/home/user/python-venv/langchain-suite/bin/python -m coding_agent.cli --print-config
-/home/user/python-venv/langchain-suite/bin/python -m coding_agent.cli \
+python -m coding_agent.cli --print-config
+python -m coding_agent.cli \
   --root /path/to/repository \
   "Implement the requested feature and give me a verified change plan"
 ```
@@ -34,11 +34,9 @@ Use the requested environment:
 
 Each model record also accepts `reasoning_effort` and `enable_thinking`. The
 specialist record uses `"reasoning_effort": "none"` and `"enable_thinking": false`
-so Spark returns its report within the configured token budget. Its installed
-template requires the explicit `enable_thinking` switch; `reasoning_effort` alone
-did not suppress thinking. The adapter passes `enable_thinking` inside
-`chat_template_kwargs`. The main record omits both settings, preserving Mellum's
-default thinking behavior. These are
+to limit reasoning output. The adapter passes `enable_thinking` inside
+`chat_template_kwargs`. The main record leaves both options unset and uses the
+server template defaults. These are
 [llama-server request options](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
 Output that reaches `max_tokens` is reported as an error.
 
@@ -61,7 +59,7 @@ The package includes a typed `zvec_grep` LangChain tool backed by the installed 
 Build an index explicitly, using `ZVEC_GREP_EMBEDDING` or an explicit embedding model:
 
 ```bash
-/home/user/python-venv/langchain-suite/bin/python -m coding_agent.cli \
+python -m coding_agent.cli \
   --root /path/to/repository \
   --zvec-index \
   --zvec-embedding local/potion-code-16m-v2
@@ -70,7 +68,7 @@ Build an index explicitly, using `ZVEC_GREP_EMBEDDING` or an explicit embedding 
 Query the existing index directly:
 
 ```bash
-/home/user/python-venv/langchain-suite/bin/python -m coding_agent.cli \
+python -m coding_agent.cli \
   --root /path/to/repository \
   --zvec-query "where is the graph constructed?" \
   --zvec-route hybrid
@@ -81,14 +79,14 @@ To use zvec results during an agent run, provide `--zvec-query` together with th
 Run the simple real-CLI smoke test with:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /home/user/python-venv/langchain-suite/bin/python \
+PYTHONDONTWRITEBYTECODE=1 python \
   -m unittest tests/test_zvec_smoke.py -v
 ```
 
 ## Tests
 
 ```bash
-/home/user/python-venv/langchain-suite/bin/python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 Ordinary tests use fake models and `httpx.MockTransport`; the zvec smoke test
@@ -96,11 +94,11 @@ also invokes the installed `zg` executable. Live model inference is opt-in:
 
 ```bash
 RUN_LIVE_MODEL_TESTS=1 PYTHONDONTWRITEBYTECODE=1 \
-  /home/user/python-venv/langchain-suite/bin/python \
+  python \
   -m unittest discover -s tests -p test_live_models.py -v
 ```
 
-This test requires `LLAMA_API_KEY`. It first verifies JSON responses from both
+This test requires `LLAMA_API_KEY` and configured model endpoints and names. It first verifies JSON responses from both
 configured llama-server endpoints, then runs the complete lead → nine
 specialists → synthesis graph against a small request-latency analytics project.
 The task is to repair a function that fails with single-use generators and empty

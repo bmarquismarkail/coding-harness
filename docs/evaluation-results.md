@@ -4,24 +4,24 @@ The implemented service passes its deterministic execution and interface suite. 
 
 ## Deterministic suite
 
-Command, using the requested environment:
+Command with the test virtual environment active:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /home/user/python-venv/langchain-suite/bin/python \
+PYTHONDONTWRITEBYTECODE=1 python \
   -m unittest discover -s tests -v
 ```
 
-Result: **48 tests discovered, 45 passed, 3 opt-in live tests skipped**, in 36.059 seconds. The retained log is `/home/user/.local/state/coding-agent-acceptance/v0.2-unittest-final.log`. `pip check` reports no broken requirements. `git diff --check` passes. `agent-config.json` and tracked `development-evidence/` have no changes.
+Result: **48 tests discovered, 45 passed, 3 opt-in live tests skipped**, in 36.059 seconds. The retained log is `~/.local/state/coding-agent-acceptance/v0.2-unittest-final.log`. `pip check` reports no broken requirements. `git diff --check` passes.
 
 The suite executes Python, C11, and C++17 repairs in actual Bubblewrap sandboxes. Trusted acceptance cases fail on baseline sources and pass after the deterministic model fixture proposes the patch; original regressions also run. The selected source checkout stays unchanged. Separate cases exercise malformed actions, stale evidence, frozen/original oracle bypasses, source modifications during checks, Git filters, dirty baselines, edit receipts/modes, interrupted commands, partial cancellation logs, separate budgets, specialist cache invalidation, one failed worker among nine, and supervisor restart/cancellation.
 
 Real SDK clients exercise stdio and Streamable HTTP submission, disconnection, event pagination, result/artifact retrieval, resume, and cancellation. HTTP tests reject missing/wrong credentials, the model key, invalid hosts/origins, and repositories outside allowed roots. Batch CLI submission survives process exit, and its results match the Python API. These transport tests use a deterministic local HTTP model fixture; they do not establish live model coding quality.
 
-The venv contains the installed editable v0.2 package, `mcp==2.3.0`, and `langgraph-checkpoint-sqlite==3.1.2`. Model identities, endpoint locations, and credential environment-variable references remain unchanged.
+The venv contains the installed editable v0.2 package, `mcp==2.3.0`, and `langgraph-checkpoint-sqlite==3.1.2`.
 
 ## Live model acceptance
 
-Eight unassisted development attempts were made through the shared service, using the configured main and specialist endpoints. No fixture patch or final synthesis was supplied manually. Every attempt remains recorded as **failed**, with its original profile, requests, responses, checks, workspace, and artifacts under `/home/user/.local/state/coding-agent-acceptance/`.
+Eight unassisted development attempts were made through the shared service, using the configured main and specialist endpoints. No fixture patch or final synthesis was supplied manually. Every attempt remains recorded as **failed**, with its original profile, requests, responses, checks, workspace, and artifacts under `~/.local/state/coding-agent-acceptance/`.
 
 | Fixture/evidence folder | Recorded outcome |
 | --- | --- |

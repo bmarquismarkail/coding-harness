@@ -156,18 +156,18 @@ class AcceptanceTests(unittest.TestCase):
             self.assertNotIn("build-output",diff)
             engine.pool.close()
 
-    def test_retained_proto_time_false_positives_cannot_become_proof(self):
-        evidence = Path(__file__).resolve().parents[1]/"development-evidence/proto-plugin-review-jQXQ6q"
-        retained = (evidence/"direct-review/source-bundle-focused/01.md").read_text()
-        self.assertLess(retained.index("if (registrationBlocks_ != 0)"), retained.index("Entry entry;"))
-        self.assertIn("cacheInterfaces", retained)
-        rejected = ["PluginManager::add lacks a registration guard", "plugin_at is used without a null check",
-                    "captureLastError lacks fallback handling", "onAttach exceptions bypass initialize's catch"]
+    def test_review_claims_cannot_become_proof(self):
+        rejected = ["PluginManager::add lacks a registration guard", "plugin_at is used without a null check"]
+        source_text = """void PluginManager::add(Plugin* plugin) {
+    if (registrationBlocks_ != 0 || plugin == nullptr) return;
+    entries_.push_back(plugin);
+}
+"""
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); source=root/"source"; source.mkdir()
-            (source/"PluginManager-excerpt.md").write_text(retained)
+            (source/"plugin_manager.cpp").write_text(source_text)
             harness=Harness(root/"state",autostart=False)
-            run_id=harness.submit(TaskRequest(root=str(source),task="Review the retained plugin source",mode="review"))
+            run_id=harness.submit(TaskRequest(root=str(source),task="Review the plugin registration source",mode="review"))
             class FalsePositive:
                 def invoke(self,messages,*,role):
                     return json.dumps({"type":"finish","summary":"Model claims confirmed defects", "findings":[

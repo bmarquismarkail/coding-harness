@@ -1,7 +1,7 @@
 """Opt-in integration test using real llama-server models and independent checks.
 
 Run from the repository root:
-  RUN_LIVE_MODEL_TESTS=1 /home/user/python-venv/langchain-suite/bin/python \
+  RUN_LIVE_MODEL_TESTS=1 python \
       -m unittest discover -s tests -p test_live_models.py -v
 
 Each invocation retains its fixture, model replies, timings, and verdict under

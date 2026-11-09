@@ -109,7 +109,7 @@ class ModelTests(unittest.TestCase):
         finally:
             client.close()
         self.assertEqual(seen["url"], "https://lead.example.invalid/v1/chat/completions")
-        self.assertEqual(seen["body"]["model"], "JetBrains/Mellum2-12B-A2.5B-Thinking")
+        self.assertEqual(seen["body"]["model"], "lead-model")
         self.assertEqual(seen["body"]["response_format"], {"type": "json_object"})
 
     def test_openai_compatible_adapter_reports_http_failure(self) -> None:

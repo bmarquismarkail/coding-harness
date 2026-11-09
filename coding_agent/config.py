@@ -229,12 +229,12 @@ def _defaults() -> dict[str, Any]:
     return {
         "main": {
             "base_url": "https://lead.example.invalid/v1",
-            "model": "JetBrains/Mellum2-12B-A2.5B-Thinking",
+            "model": "lead-model",
             "api_key_env": "LLAMA_API_KEY",
         },
         "subagents": {
             "base_url": "https://specialist.example.invalid/v1",
-            "model": "XHToken/Spark-X2.6-4B",
+            "model": "specialist-model",
             "api_key_env": "LLAMA_API_KEY",
             "parallelism": 9,
             "reasoning_effort": "none",
