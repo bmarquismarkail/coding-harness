@@ -16,6 +16,7 @@ from .profiles import resolve_profile
 from .project_profiles import load_definitions, resolve_request, skill_metadata
 from .store import Store
 from .types import RunResult, TaskRequest
+from .workspace import checked_path
 
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "needs_input"}
 
@@ -56,8 +57,11 @@ class Harness:
         return row
 
     def submit(self, request: TaskRequest | dict) -> str:
+        """Authorize a request and queue it with frozen configuration and probes."""
         request = TaskRequest.model_validate(request)
         source = self._authorize(request.root)
+        for focus in request.focus_paths:
+            checked_path(source, focus)
         request, skills = resolve_request(request, source, self.project_profiles)
         for dependency in request.readonly_dependencies:
             p = Path(dependency).expanduser().resolve()

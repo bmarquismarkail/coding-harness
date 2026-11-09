@@ -18,6 +18,7 @@ def read_json(store, run_id, artifact_id):
 
 
 def freeze_bundle(engine, coverage=None):
+    """Persist source, patch, and check evidence and update coverage from valid reads."""
     store, rid, workspace = engine.store, engine.run_id, engine.workspace
     checks, sources, probes, gaps = [], [], [], []
     for receipt in store.receipts(rid, 'check'):

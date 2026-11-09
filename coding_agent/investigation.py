@@ -3,11 +3,12 @@ import re
 import time
 from pathlib import Path
 from .review_types import Coverage
-from .workspace import paths
+from .workspace import checked_path, paths
 
 
 def discover_scope(workspace, profile, focus_paths=(), *, implementation=False,
                    clock=time.monotonic, cancelled=lambda: False):
+    """Expand patch and focus paths into a scope bounded by the discovery profile."""
     if cancelled():
         return Coverage(limit_reached='cancelled', unenumerated_remainder=True)
 
@@ -19,7 +20,11 @@ def discover_scope(workspace, profile, focus_paths=(), *, implementation=False,
         available.setdefault(path, workspace.baseline / path)
     focused = []
     for focus in focus_paths:
-        focus = Path(focus).as_posix()
+        try:
+            focus = checked_path(workspace.root, focus).relative_to(workspace.root).as_posix()
+        except ValueError:
+            # Older queued requests may contain paths that now fail intake validation.
+            continue
         matches = sorted(path for path in available
                          if path == focus or focus == '.' or path.startswith(focus + '/'))
         focused.extend(matches or [focus])

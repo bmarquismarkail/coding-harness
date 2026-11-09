@@ -22,6 +22,7 @@ FIXTURE = Path(__file__).parent / 'fixtures/cpp-8uqnat7r'
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
+        """Restore the archived workspace, check receipts, and reviewer response."""
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.record = json.loads((FIXTURE/'record.json').read_text())
@@ -76,6 +77,7 @@ class EvidenceTests(unittest.TestCase):
             diagnosis='Clamp observation', diagnosis_sources=['retained-fixture'])
 
     def test_original_bytes_reproduce_baseline_and_revised_acceptance_pair(self):
+        """Replay the archived check against the original and revised snapshots."""
         baseline = json.loads((FIXTURE/'baseline-result.json').read_text())
         original = self.finish(self.raw['gaps'])
         self.assertEqual(original.outcome, baseline['outcome'])
@@ -164,6 +166,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(found[0].status, 'needs_human_review')
 
     def test_genuine_concerns_survive_rejected_factual_challenges(self):
+        """Retain semantic concerns when a factual challenge is rejected."""
         bundle, aid = self.bundle()
         legacy_gap = 'The acceptance check exercises only one difficulty.'
         semantic_concern = 'The original report does not assess negative inputs.'
@@ -316,7 +319,31 @@ class InvestigationTests(unittest.TestCase):
             scope = discover_scope(workspace, Profile(name='test'), clock=lambda: next(ticks))
             self.assertEqual(scope.limit_reached, 'seconds')
 
+    def test_focus_paths_use_workspace_path_safety(self):
+        """Reject unsafe requests and exclude unsafe paths from older jobs' scopes."""
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'deleted.py').write_text('x = 1\n')
+            harness = Harness(root / 'state', autostart=False)
+            request = dict(root=str(source), task='Review paths', mode='review')
+            invalid = ['../outside.py', 'src/../deleted.py', '.git/config', '.env', str(root / 'outside.py')]
+            for focus in invalid:
+                with self.subTest(focus=focus), self.assertRaises(ValueError):
+                    harness.submit({**request, 'focus_paths': [focus]})
+
+            valid = ['./deleted.py', 'new/module.py', '.env.example']
+            run_id = harness.submit({**request, 'focus_paths': valid})
+            workspace = Workspace(harness.store.run_dir(run_id))
+            workspace.prepare(source)
+            (workspace.root / 'deleted.py').unlink()
+            scope = discover_scope(workspace, Profile(name='test'), [*invalid, *valid])
+            self.assertEqual(scope.intended_paths, ['deleted.py', 'new/module.py', '.env.example'])
+
     def test_scope_limits_keep_patch_and_focus_seeds(self):
+        """Seed discovery with exact patch and focus paths before applying scan budgets."""
         from coding_agent.workspace import Workspace
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); source = root/'source'; source.mkdir()
@@ -338,6 +365,7 @@ class InvestigationTests(unittest.TestCase):
                     self.assertTrue(scope.unenumerated_remainder)
 
     def test_review_completion_requires_evidence_for_each_intended_path(self):
+        """Require valid candidate reads of both files for complete review coverage."""
         for second_read in (None, {'start': 2}, {'baseline': True}, {}):
             with self.subTest(second_read=second_read), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory); source = root/'source'; source.mkdir()
@@ -355,6 +383,7 @@ class InvestigationTests(unittest.TestCase):
 
                 class Provider:
                     def invoke(self, messages, *, role):
+                        """Replay the selected reads and return an empty independent review."""
                         return '{}' if role == 'reviewer' else json.dumps(next(actions))
 
                 Engine(harness.store, rid, Provider()).execute()
@@ -384,11 +413,12 @@ class InvestigationTests(unittest.TestCase):
             self.assertTrue(scope.unenumerated_remainder)
 
     def test_drafts_survive_protocol_exhaustion_and_cancellation(self):
-        for cancel in (False, True):
-            with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as d:
+        """Recover draft findings when review or implementation stops early."""
+        for mode, cancel in (('review', False), ('review', True), ('implement', False)):
+            with self.subTest(mode=mode, cancel=cancel), tempfile.TemporaryDirectory() as d:
                 root = Path(d); source = root/'source'; source.mkdir(); (source/'x.py').write_text('x=1\n')
                 harness = Harness(root/'state', autostart=False)
-                rid = harness.submit(TaskRequest(root=str(source), task='Review x', mode='review'))
+                rid = harness.submit(TaskRequest(root=str(source), task='Investigate x', mode=mode))
                 class Provider:
                     calls = 0
                     def invoke(self, messages, *, role):
@@ -404,6 +434,8 @@ class InvestigationTests(unittest.TestCase):
                 engine = Engine(harness.store, rid, Provider()); engine.execute()
                 result = harness.result(rid)
                 self.assertEqual(result.review.completion, 'partial')
+                if not cancel:
+                    self.assertIn('protocol_failure', result.review.partial_reasons)
                 self.assertEqual(len(result.review.findings), 1)
                 self.assertEqual(result.outcome, 'cancelled' if cancel else 'unverified')
 

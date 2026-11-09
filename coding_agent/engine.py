@@ -308,6 +308,7 @@ class Engine:
         return "\n".join(chunks)
 
     def graph(self, saver):
+        """Build the checkpointed model, tool, and finalization loop."""
         def model(state):
             self.guard()
             raw = self.provider.invoke(bounded_messages(state["messages"], self.profile.main_context_bytes), role="main")
@@ -367,6 +368,7 @@ class Engine:
             return updates
 
         def finalize(state):
+            """Adjudicate findings and record a result or return failed checks for repair."""
             action = FinishAction.model_validate(state["action"])
             if action.review and action.review.findings:
                 artifact = self.store.artifact(self.run_id, {"findings": [f.model_dump() for f in action.review.findings]})
@@ -409,9 +411,9 @@ class Engine:
             findings = list(action.findings)
             proposed = action.review.model_dump() if action.review else {"findings": []}
             proposed["findings"].extend(action.findings)
-            # Working drafts remain recoverable. An implementation finding
-            # becomes active when it is submitted as part of the final review.
-            if self.request.mode == "review" or state.get("forced_finish"):
+            reasons = list(state.get("partial_reasons", []))
+            # Implementation drafts become active on final submission or early recovery.
+            if self.request.mode == "review" or state.get("forced_finish") or "protocol_failure" in reasons:
                 for receipt in self.store.receipts(self.run_id, "draft_findings"):
                     draft = read_json(self.store, self.run_id, receipt["data"]["artifact_id"])
                     proposed["findings"].extend(draft["findings"])
@@ -434,7 +436,6 @@ class Engine:
                     self.broker.read_evidence(EvidenceArgs(artifact_id=evidence_id))
                 except (ValueError, OSError, KeyError):
                     gaps.append("The diagnosis cites stale, missing, or non-source evidence.")
-            reasons = list(state.get("partial_reasons", []))
             if any(g.startswith(("Invalid reviewer response", "Independent reviewer unavailable")) for g in gaps):
                 reasons.append("protocol_failure")
             if self.coverage.limit_reached:

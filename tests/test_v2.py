@@ -114,11 +114,13 @@ class RuntimeTests(unittest.TestCase):
                          next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
 
     def test_investigative_draft_does_not_block_verified_repair(self):
+        """Keep a working draft available without treating it as a final finding."""
         draft = {"id": "iterator", "title": "Iterator bug", "claim": "Generators have no len()",
                  "path": "latency.py"}
 
         class DraftProvider(RepairProvider):
             def invoke(self, messages, *, role):
+                """File one draft before the writer proceeds with the repair."""
                 if role == "main" and self.main_calls == 1 and not hasattr(self, "drafted"):
                     self.drafted = True
                     return json.dumps({"type": "tool", "tool": "report_findings", "args": {"findings": [draft]}})
@@ -137,11 +139,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(json.loads(raw)["findings"][0]["id"], draft["id"])
 
     def test_final_specialist_finding_blocks_verification(self):
+        """Require resolution of concrete findings raised by the final specialist."""
         finding = {"id": "regression", "title": "Candidate defect", "claim": "Needs resolution",
                    "path": "latency.py"}
 
         class FindingProvider(RepairProvider):
             def invoke(self, messages, *, role):
+                """Return a concrete finding from the specialist review."""
                 if role == "subagent":
                     return json.dumps({"type": "finish", "summary": "Reviewed candidate",
                                        "findings": [finding], "review": {"observations": ["Checks ran"]}})
