@@ -44,14 +44,16 @@ class TaskRequest(Contract):
     mode: Literal["implement", "review"] = "implement"
     task_type: Literal["bugfix", "feature", "refactor"] = "bugfix"
     profile: str | None = None
-    checks: list[CheckSpec] = Field(default_factory=list, max_length=50)
+    project_profile: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    skill_ids: list[str] | None = Field(default=None, max_length=20)
+    checks: list[CheckSpec] | None = Field(default=None, max_length=50)
     readonly_dependencies: list[str] = Field(default_factory=list, max_length=20)
     focus_paths: list[str] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def check_graph(self):
         known: set[str] = set()
-        for check in self.checks:
+        for check in self.checks or []:
             if check.id in known or not set(check.requires) <= known:
                 raise ValueError("check IDs must be unique and prerequisites must occur earlier")
             known.add(check.id)
@@ -76,6 +78,18 @@ class RunStatus(Contract):
     updated_at: float
 
 
+class EvidencePackage(Contract):
+    baseline_checks: list[dict[str, Any]] = Field(default_factory=list)
+    reproducer_artifacts: list[str] = Field(default_factory=list)
+    diagnosis: str = ""
+    diagnosis_sources: list[str] = Field(default_factory=list)
+    patch_artifact: str | None = None
+    patch_source_hash: str | None = None
+    verification_checks: list[dict[str, Any]] = Field(default_factory=list)
+    remaining_gaps: list[str] = Field(default_factory=list)
+    skill_snapshots: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class RunResult(Contract):
     run_id: str
     outcome: Literal["verified", "unverified", "failed", "cancelled"]
@@ -83,7 +97,8 @@ class RunResult(Contract):
     patch: str = ""
     patch_artifact: str | None = None
     checks: list[dict[str, Any]] = Field(default_factory=list)
-    evidence: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    evidence: EvidencePackage | None = None
     findings: list[dict[str, Any]] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
 
@@ -99,6 +114,8 @@ class FinishAction(Contract):
     summary: str = Field(min_length=1, max_length=12000)
     findings: list[dict[str, Any]] = Field(default_factory=list, max_length=30)
     gaps: list[str] = Field(default_factory=list, max_length=30)
+    diagnosis: str = Field(default="", max_length=12000)
+    diagnosis_sources: list[str] = Field(default_factory=list, max_length=50)
 
 
 class InputAction(Contract):

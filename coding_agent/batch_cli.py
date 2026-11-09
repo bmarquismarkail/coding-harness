@@ -21,6 +21,9 @@ def parser():
             sub.add_argument("--mode", choices=["implement", "review"], default="implement")
             sub.add_argument("--task-type", choices=["bugfix", "feature", "refactor"], default="bugfix")
             sub.add_argument("--profile")
+            sub.add_argument("--project-profile")
+            sub.add_argument("--skill", action="append", dest="skill_ids", default=None)
+            sub.add_argument("--no-skills", action="store_true", help="explicitly disable project default skills")
             sub.add_argument("--checks", help="JSON file containing a list of CheckSpec objects")
             sub.add_argument("--dependency", action="append", default=[])
             sub.add_argument("--wait", action="store_true")
@@ -60,9 +63,13 @@ def main(argv=None):
         name = args.command
         if name in {"run", "submit"}:
             from pathlib import Path
-            checks = json.loads(Path(args.checks).read_text()) if args.checks else []
+            checks = json.loads(Path(args.checks).read_text()) if args.checks else None
+            if args.no_skills and args.skill_ids:
+                raise ValueError("--no-skills cannot be combined with --skill")
+            skill_ids = [] if args.no_skills else args.skill_ids
             run_id = harness.submit(TaskRequest(root=args.root, task=args.task, mode=args.mode, task_type=args.task_type,
-                                                profile=args.profile, checks=checks, readonly_dependencies=args.dependency))
+                                                profile=args.profile, project_profile=args.project_profile,
+                                                skill_ids=skill_ids, checks=checks, readonly_dependencies=args.dependency))
             if not args.wait:
                 result = {"run_id": run_id, "state": "queued"}
             else:

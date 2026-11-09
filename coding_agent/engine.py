@@ -16,10 +16,11 @@ from langgraph.types import Command, interrupt
 from .checks import Checks
 from .config import AgentConfig
 from .profiles import configured_models
+from .project_profiles import skill_context, skill_metadata
 from .runtime_model import RecordingProvider
 from .sandbox import SandboxError, SandboxRunner
 from .store import Store
-from .tools import ListArgs, ReadArgs, ToolBroker, WorkerTask
+from .tools import EvidenceArgs, ListArgs, ReadArgs, ToolBroker, WorkerTask
 from .types import FinishAction, InputAction, Profile, TaskRequest, ToolAction, parse_action
 from .workspace import Workspace, checked_path, paths, tree_hash
 from .zvec import ZvecGrepSettings, ZvecGrepTool
@@ -56,7 +57,7 @@ def bounded_messages(messages: list[dict], budget: int) -> list[dict]:
     return fixed+list(reversed(result))
 
 
-def instructions(broker: ToolBroker, specialist=False) -> str:
+def instructions(broker: ToolBroker, specialist=False, skills=None) -> str:
     return (
         "You are a read-only coding specialist. " if specialist else "You are the sole writing coding agent for an isolated repository workspace. "
     ) + (
@@ -72,7 +73,10 @@ def instructions(broker: ToolBroker, specialist=False) -> str:
         "New test files can be frozen with register_check before running them against both baseline and candidate. "
         "Delegate only focused questions with explicit paths; collect specialists before editing or running code. "
         "Finish when the requested patch is ready, not after planning alone. Final checks and a fresh review run automatically. "
-        "Findings without independent reproduction remain hypotheses. Keep observations concise.\nAVAILABLE TOOLS:\n"
+        "Findings without independent reproduction remain hypotheses. Keep observations concise. "
+        "At finish, include diagnosis and diagnosis_sources using evidence IDs returned by read_file or read_evidence. "
+        "A diagnosis citation is a source reference, not proof that a check passed.\nPROJECT SKILLS (read-only guidance):\n"
+        + skill_context(skills or []) + "\nAVAILABLE TOOLS:\n"
         + json.dumps(broker.schemas(), separators=(",", ":"))
         + '\nACTION ENVELOPE: always {"type":"tool","tool":"TOOL_NAME","args":{...}}. '
           'Do not put a tool name in the type field. Findings are JSON objects, not strings. '
@@ -147,7 +151,7 @@ class SpecialistPool:
         broker = ToolBroker(e.store, e.run_id, e.workspace, e.checks, scope=task.paths, mode=e.request.mode, zvec=e.zvec)
         if not data["messages"]:
             seed = e.seed(broker, task.paths, limit=3000)
-            data["messages"] = [{"role": "system", "content": instructions(broker, specialist=True)},
+            data["messages"] = [{"role": "system", "content": instructions(broker, specialist=True, skills=e.skills)},
                                 {"role": "user", "content": task.task+"\n"+seed}]
         try:
             while data["step"] < e.profile.worker_max_actions:
@@ -218,6 +222,8 @@ class Engine:
         self.store, self.run_id = store, run_id
         self.run = store.get(run_id)
         self.request = TaskRequest.model_validate(self.run["request"])
+        self.skills = self.run["config"].get("_resolved_skills", [])
+        self.skill_snapshots = self.run["config"].get("_skill_metadata", skill_metadata(self.skills))
         self.profile = Profile.model_validate(self.run["profile"])
         self.workspace = Workspace(store.run_dir(run_id))
         self.stop = threading.Event()
@@ -359,11 +365,18 @@ class Engine:
             for finding in findings:
                 for evidence_id in finding.get("evidence_ids", []):
                     try:
-                        from .tools import EvidenceArgs
                         self.broker.read_evidence(EvidenceArgs(artifact_id=evidence_id))
                     except (ValueError, OSError, KeyError):
                         gaps.append("A final finding cites stale or invalid source evidence.")
-            result = self.checks.finish(self.request, action.summary, findings, gaps)
+            for evidence_id in action.diagnosis_sources:
+                try:
+                    self.broker.read_evidence(EvidenceArgs(artifact_id=evidence_id))
+                except (ValueError, OSError, KeyError):
+                    gaps.append("The diagnosis cites stale, missing, or non-source evidence.")
+            result = self.checks.finish(self.request, action.summary, findings, gaps,
+                                        diagnosis=action.diagnosis or action.summary,
+                                        diagnosis_sources=action.diagnosis_sources,
+                                        skill_snapshots=self.skill_snapshots)
             attempts = state.get("final_attempts", 0)+1
             # A premature finish with failed checks returns evidence to the writer.
             # This is bounded and checkpointed, never an automatic success upgrade.
@@ -396,7 +409,8 @@ class Engine:
             "verdict, findings, and gaps; findings are for unsupported or overstated conclusions and gaps are for missing evidence. "
             "Treat every finding as a hypothesis unless the supplied evidence directly supports it."
         )}, {"role": "user", "content": json.dumps({
-            "task": self.request.task, "summary": summary, "findings": findings, "gaps": gaps
+            "task": self.request.task, "summary": summary, "findings": findings, "gaps": gaps,
+            "project_profile": self.request.project_profile, "skills": self.skill_snapshots
         }, ensure_ascii=False)}]
         try:
             raw = self.provider.invoke(prompt, role="reviewer")
@@ -440,7 +454,7 @@ class Engine:
                         initial = Command(resume=self.run["config"]["_answer"])
                 else:
                     initial = {"step": 0, "messages": [
-                        {"role": "system", "content": instructions(self.broker)},
+                        {"role": "system", "content": instructions(self.broker, skills=self.skills)},
                         {"role": "user", "content": f"MODE: {self.request.mode}; TASK TYPE: {self.request.task_type}\nTASK: {self.request.task}\n"+self.seed(self.broker, scopes=self.request.focus_paths)}]}
                 outcome = graph.invoke(initial, config)
                 if outcome.get("__interrupt__"):
@@ -453,6 +467,8 @@ class Engine:
                 markdown = f"# Run {self.run_id}\n\nOutcome: {result['outcome']}\n\n{result['summary']}\n\n"
                 markdown += f"Patch artifact: {result['patch_artifact']}\n\nExecuted checks:\n\n"
                 markdown += "\n".join(f"- {c['phase']}: {c['check_id']}: {'PASS' if c.get('passed') else 'FAIL/SKIPPED'}; source {c.get('source_hash')}; artifact {c.get('artifact_id')}" for c in result["checks"])
+                markdown += "\n\nEvidence package:\n\n"
+                markdown += json.dumps(result.get("evidence"), indent=2)
                 markdown += "\n\nRemaining gaps:\n\n"+"\n".join(f"- {gap}" for gap in result["gaps"])
                 self.store.event(self.run_id, "report", {"result_artifact": artifact, "report_artifact": self.store.artifact(self.run_id, markdown)})
                 self.store.transition(self.run_id, "completed", result=result)
@@ -469,14 +485,25 @@ class Engine:
             self.pool.close()
 
     def partial_result(self, outcome, reason):
-        from .types import RunResult
+        from .types import EvidencePackage, RunResult
         patch = self.workspace.patch() if (self.workspace.folder / "baseline.index").exists() else ""
         checks = [{**r["data"], "receipt_state":r["state"]} for r in self.store.receipts(self.run_id, "check")]
+        current_hash = tree_hash(self.workspace.root) if (self.workspace.folder / "workspace.json").exists() else None
+        baseline = [{k:c.get(k) for k in ("check_id", "source_hash", "passed", "exit_code", "artifact_id", "skipped", "timed_out")}
+                    for c in checks if c.get("phase") == "baseline"]
+        verification = [{k:c.get(k) for k in ("check_id", "source_hash", "passed", "exit_code", "artifact_id", "skipped", "timed_out")}
+                        for c in checks if c.get("phase") == "candidate"]
+        package = EvidencePackage(baseline_checks=baseline,
+                                  reproducer_artifacts=[c["artifact_id"] for c in checks if c.get("phase") == "baseline" and c.get("artifact_id")],
+                                  patch_artifact=self.store.artifact(self.run_id, patch), patch_source_hash=current_hash,
+                                  verification_checks=verification, remaining_gaps=["Execution stopped before the workflow and verification completed."],
+                                  skill_snapshots=self.skill_snapshots)
         return RunResult(run_id=self.run_id, outcome=outcome, summary=reason, patch=patch,
                          patch_artifact=self.store.artifact(self.run_id, patch),
                          checks=[{k:v for k,v in c.items() if k != "output"} for c in checks],
-                         evidence=sorted({c["artifact_id"] for c in checks if c.get("artifact_id")}),
-                         gaps=["Execution stopped before the workflow and verification completed."]).model_dump()
+                         evidence_ids=sorted({c["artifact_id"] for c in checks if c.get("artifact_id")}),
+                         evidence=package,
+                         gaps=package.remaining_gaps).model_dump()
 
 
 def digest_local(path):

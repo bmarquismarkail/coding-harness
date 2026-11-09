@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .sandbox import SandboxRunner, CommandCancelled
 from .store import Store
-from .types import CheckSpec, RunResult, TaskRequest
+from .types import CheckSpec, EvidencePackage, RunResult, TaskRequest
 from .workspace import Workspace, checked_path, digest, manifest, tree_hash
 
 
@@ -20,10 +20,10 @@ class Checks:
         self.path = workspace.folder / "checks.json"
 
     def initialize(self, request: TaskRequest):
-        self._request_specs = list(request.checks)
+        self._request_specs = list(request.checks or [])
         if self.path.exists():
             return
-        checks = [{"spec": c.model_dump(), "origin": "request", "oracle": {}} for c in request.checks]
+        checks = [{"spec": c.model_dump(), "origin": "request", "oracle": {}} for c in (request.checks or [])]
         root = self.workspace.baseline
         if not any(c["spec"]["kind"] == "regression" for c in checks):
             discovered = []
@@ -141,7 +141,9 @@ class Checks:
         requested = {c.id for c in self._request_specs}
         return [self.execute(check_id, phase, key=f"{prefix}:{check_id}") for check_id in requested]
 
-    def finish(self, request: TaskRequest, summary: str, findings: list, gaps: list[str]) -> RunResult:
+    def finish(self, request: TaskRequest, summary: str, findings: list, gaps: list[str], *,
+               diagnosis: str = "", diagnosis_sources: list[str] | None = None,
+               skill_snapshots: list[dict] | None = None) -> RunResult:
         patch = self.workspace.patch()
         fingerprint = tree_hash(self.workspace.root)
         records = [r["data"] for r in self.store.receipts(self.run_id, "check") if r["state"] == "completed"]
@@ -180,6 +182,8 @@ class Checks:
             gaps.append(f"Original test/build oracle changed: {relative}")
         if request.mode == "implement" and not patch:
             gaps.append("Implementation produced no patch.")
+        if request.mode == "implement" and not diagnosis.strip():
+            gaps.append("Evidence package has no diagnosis.")
         if request.mode == "review":
             gaps.append("Review findings are hypotheses; model agreement is not independent verification.")
         # A model cannot promote its own classification to a proof.
@@ -196,9 +200,27 @@ class Checks:
                     if hashlib.sha256(raw).hexdigest() != value["artifact_id"]:
                         raise RuntimeError("retained check artifact failed its integrity check")
                     history[value["artifact_id"]] = {**json.loads(raw), "artifact_id":value["artifact_id"]}
+        sources = list(dict.fromkeys(diagnosis_sources or []))
+        if request.mode == "implement" and not sources:
+            gaps.append("Evidence package diagnosis has no source citations.")
+        evidence_package = EvidencePackage(
+            baseline_checks=[{k:r.get(k) for k in ("check_id", "source_hash", "passed", "exit_code", "artifact_id", "skipped", "timed_out")}
+                             for r in records if r.get("phase") == "baseline"],
+            reproducer_artifacts=list(dict.fromkeys(r["artifact_id"] for r in records
+                                                    if r.get("phase") == "baseline" and r.get("artifact_id")
+                                                    and r.get("check_id") in {c["spec"]["id"] for c in acceptance})),
+            diagnosis=diagnosis,
+            diagnosis_sources=sources,
+            patch_artifact=artifact,
+            patch_source_hash=fingerprint,
+            verification_checks=[{k:r.get(k) for k in ("check_id", "source_hash", "passed", "exit_code", "artifact_id", "skipped", "timed_out")}
+                                 for r in candidates],
+            remaining_gaps=sorted(set(gaps)),
+            skill_snapshots=skill_snapshots or [],
+        )
         result = RunResult(run_id=self.run_id, outcome="verified" if not gaps else "unverified", summary=summary,
                            patch=patch, patch_artifact=artifact,
                            checks=[{k: v for k, v in r.items() if k != "output"} for r in [*history.values(), *[r for r in records if not r.get("artifact_id")]]],
-                           evidence=sorted(evidence),
+                           evidence_ids=sorted(evidence), evidence=evidence_package,
                            findings=findings, gaps=sorted(set(gaps)))
         return result

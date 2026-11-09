@@ -51,6 +51,19 @@ def request(root: Path, **kwargs):
                        checks=[CheckSpec(id="acceptance", argv=[sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_acceptance.py"])], **kwargs)
 
 
+def cited_source(messages):
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        try:
+            evidence_id = json.loads(message["content"]).get("result", {}).get("evidence_id")
+            if evidence_id:
+                return [evidence_id]
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return []
+
+
 class RepairProvider:
     def __init__(self, content=GOOD):
         self.main_calls = 0
@@ -67,7 +80,7 @@ class RepairProvider:
         if self.main_calls == 2:
             return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [
                 {"path": "latency.py", "expected_hash": hashlib.sha256(BAD.encode()).hexdigest(), "content": self.content}]}})
-        return json.dumps({"type": "finish", "summary": "Fixed generator averaging", "findings": [], "gaps": []})
+        return json.dumps({"type": "finish", "summary": "Fixed generator averaging", "diagnosis": "The implementation used len() and repeated iteration, which fails for one-shot iterators.", "diagnosis_sources": cited_source(messages), "findings": [], "gaps": []})
 
 
 class RuntimeTests(unittest.TestCase):
@@ -94,6 +107,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(provider.worker_calls, 1)
         self.assertTrue(any(c["phase"] == "baseline" and not c["passed"] for c in result.checks))
         self.assertTrue(all(c["passed"] for c in result.checks if c["phase"] == "candidate"))
+        self.assertEqual(result.evidence.patch_artifact, result.patch_artifact)
+        self.assertTrue(result.evidence.reproducer_artifacts)
+        self.assertTrue(result.evidence.diagnosis_sources)
+        self.assertEqual(result.evidence.patch_source_hash,
+                         next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
 
     def test_wrong_patch_cannot_claim_verification(self):
         run_id = self.harness.submit(request(self.source))
@@ -132,9 +150,12 @@ class RuntimeTests(unittest.TestCase):
         (engine.workspace.root / "latency.py").write_text(GOOD)
         result = engine.broker.apply_patch(args, key="edit-test")
         self.assertEqual((engine.workspace.root / "new.py").read_text(), "answer = 42\n")
-        with self.assertRaisesRegex(ValueError, "stale"):
-            engine.broker.read_evidence(EvidenceArgs(artifact_id=read["evidence_id"]))
+        self.assertEqual(engine.broker.read_evidence(EvidenceArgs(artifact_id=read["evidence_id"]))["validated_against"], "baseline")
         self.assertEqual(engine.broker.apply_patch(args, key="edit-test")["files"], result["files"])
+        candidate_read = engine.broker.read_file(ReadArgs(path="latency.py"))
+        (engine.workspace.root / "latency.py").write_text("def mean_latency(samples):\n    return 0\n")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            engine.broker.read_evidence(EvidenceArgs(artifact_id=candidate_read["evidence_id"]))
         engine.pool.close()
 
     def test_bubblewrap_cannot_see_host_credentials_or_write_source(self):

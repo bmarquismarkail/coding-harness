@@ -228,8 +228,12 @@ class ToolBroker:
         record = json.loads(data["content"])
         if record.get("kind") != "source":
             raise ValueError("artifact is not source evidence")
-        if digest(self._path(record["path"], record.get("baseline", False))) != record["sha256"]:
-            raise ValueError("source evidence is stale; read the current file again")
+        source = self._path(record["path"], record.get("baseline", False))
+        if digest(source) != record["sha256"]:
+            baseline = self._path(record["path"], True)
+            if record.get("baseline", False) or digest(baseline) != record["sha256"]:
+                raise ValueError("source evidence is stale; read the current file again")
+            record["validated_against"] = "baseline"
         return record
 
     def read_artifact(self, args: ArtifactArgs, **_):

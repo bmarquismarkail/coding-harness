@@ -10,7 +10,7 @@ import subprocess
 import re
 from pathlib import Path
 
-EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
+EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", "bin", "obj",
                  ".zvec-grep", ".harness", ".cache", "build", "dist", "target", "development-evidence"}
 SECRET_NAMES = {".env", ".netrc", ".npmrc", ".pypirc", "credentials.json", "id_rsa", "id_ed25519"}
 OUTPUT_SUFFIXES = {".pyc", ".o", ".a", ".so", ".dll", ".exe", ".class"}

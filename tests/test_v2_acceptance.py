@@ -15,7 +15,7 @@ from coding_agent import CheckSpec, Harness, TaskRequest
 from coding_agent.engine import Engine
 from coding_agent.tools import Change, CommandArgs, PatchArgs, ReadArgs
 from coding_agent.workspace import digest, tree_hash
-from test_v2 import BAD, GOOD, RepairProvider, fixture, request
+from test_v2 import BAD, GOOD, RepairProvider, cited_source, fixture, request
 
 CPP_BAD = "inline int clamp_level(int v) { if (v < 0) return 0; if (v > 100) return 99; return v; }\n"
 CPP_GOOD = CPP_BAD.replace("return 99", "return 100")
@@ -56,7 +56,7 @@ class AcceptanceTests(unittest.TestCase):
                     if self.calls==2:
                         return json.dumps({"type":"tool","tool":"apply_patch","args":{"changes":[
                             {"path":"level.hpp","expected_hash":hashlib.sha256(before.encode()).hexdigest(),"content":after}]}})
-                    return '{"type":"finish","summary":"Repaired C clamp","findings":[],"gaps":[]}'
+                    return json.dumps({"type":"finish","summary":"Repaired C clamp","diagnosis":"The clamp returned 99 for values above its maximum.","diagnosis_sources":cited_source(messages),"findings":[],"gaps":[]})
             harness=Harness(root/"state",autostart=False); run_id=harness.submit(req)
             Engine(harness.store,run_id,Provider()).execute()
             result=harness.result(run_id)
@@ -76,7 +76,7 @@ class AcceptanceTests(unittest.TestCase):
                     if self.main_calls == 2:
                         return json.dumps({"type":"tool","tool":"apply_patch","args":{"changes":[
                             {"path":"level.hpp","expected_hash":hashlib.sha256(CPP_BAD.encode()).hexdigest(),"content":CPP_GOOD}]}})
-                    return json.dumps({"type":"finish","summary":"Fixed upper-bound clamping","findings":[],"gaps":[]})
+                    return json.dumps({"type":"finish","summary":"Fixed upper-bound clamping","diagnosis":"The function returned 99 where its contract requires a maximum of 100.","diagnosis_sources":cited_source(messages),"findings":[],"gaps":[]})
             harness = Harness(root/"state", autostart=False)
             run_id = harness.submit(req)
             Engine(harness.store, run_id, Provider()).execute()
@@ -115,7 +115,10 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(result["exit_code"], 0); self.assertIn("rerun proof", result["output"])
             self.assertEqual(harness.store.receipt(run_id, "command")["state"], "completed")
             engine.store.transition(run_id,"running")
-            timer = threading.Timer(0.2, engine.stop.set); timer.start()
+            # Leave enough time for the child process to start and flush its
+            # first line before cancellation; otherwise slow CI hosts can kill
+            # it during interpreter startup and make this assertion flaky.
+            timer = threading.Timer(0.75, engine.stop.set); timer.start()
             started = time.monotonic()
             with self.assertRaises(InterruptedError):
                 engine.broker.run_command(CommandArgs(argv=[sys.executable,"-u","-c","import time;print('before cancel');time.sleep(60)"]), key="cancelled-command")

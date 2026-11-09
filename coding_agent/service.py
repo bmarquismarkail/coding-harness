@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .config import AgentConfig, load_config
 from .profiles import resolve_profile
+from .project_profiles import load_definitions, resolve_request, skill_metadata
 from .store import Store
 from .types import RunResult, TaskRequest
 
@@ -22,14 +23,19 @@ TERMINAL = {"completed", "cancelled", "failed", "interrupted", "needs_input"}
 class Harness:
     def __init__(self, state_dir: str | Path | None = None, *, config_path: str | Path | None = None,
                  config: AgentConfig | None = None, profiles: dict | None = None,
+                 project_profiles: dict | None = None,
                  allowed_roots: list[str] | None = None, allowed_dependencies: list[str] | None = None,
                  autostart: bool = True):
         self.store = Store(state_dir)
         self.config = config or load_config(config_path)
         self.profiles = dict(profiles or {})
         selected_config = Path(config_path or "agent-config.json")
+        self.project_profiles = load_definitions()
+        self.project_profiles.update(project_profiles or {})
         if selected_config.exists():
-            self.profiles = {**json.loads(selected_config.read_text()).get("profiles", {}), **self.profiles}
+            raw_config = json.loads(selected_config.read_text())
+            self.profiles = {**raw_config.get("profiles", {}), **self.profiles}
+            self.project_profiles.update(raw_config.get("project_profiles", {}))
         self.allowed_roots = [Path(p).expanduser().resolve() for p in allowed_roots] if allowed_roots is not None else None
         self.allowed_dependencies = [Path(p).expanduser().resolve() for p in (allowed_dependencies or [])]
         self.autostart = autostart
@@ -52,6 +58,7 @@ class Harness:
     def submit(self, request: TaskRequest | dict) -> str:
         request = TaskRequest.model_validate(request)
         source = self._authorize(request.root)
+        request, skills = resolve_request(request, source, self.project_profiles)
         for dependency in request.readonly_dependencies:
             p = Path(dependency).expanduser().resolve()
             if self.allowed_roots is not None and not any(p.is_relative_to(r) for r in self.allowed_dependencies):
@@ -60,8 +67,11 @@ class Harness:
                 raise ValueError("dependency must be a specific existing path")
         request = request.model_copy(update={"root": str(source), "readonly_dependencies": [str(Path(p).resolve()) for p in request.readonly_dependencies]})
         profile = resolve_profile(request.profile or ("review" if request.mode == "review" else "coding"), self.config, self.profiles)
+        frozen_config = asdict(self.config)
+        frozen_config["_resolved_skills"] = skills
+        frozen_config["_skill_metadata"] = skill_metadata(skills)
         with self.store.queue_lock():
-            run_id = self.store.create(request.model_dump(), asdict(self.config), profile.model_dump())
+            run_id = self.store.create(request.model_dump(), frozen_config, profile.model_dump())
             if self.autostart:
                 self._start_supervisor()
         return run_id

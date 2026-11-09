@@ -4,10 +4,10 @@ from .config import AgentConfig, ConfigError, load_config
 from .graph import create_graph, run_agent
 from .zvec import ZvecGrepError, ZvecGrepSettings, ZvecGrepTool, zvec_grep_tool
 from .service import Harness
-from .types import CheckSpec, TaskRequest, RunResult, RunStatus, Profile
+from .types import CheckSpec, EvidencePackage, TaskRequest, RunResult, RunStatus, Profile
 
 __all__ = [
     "AgentConfig", "ConfigError", "ZvecGrepError", "ZvecGrepSettings", "ZvecGrepTool",
     "create_graph", "load_config", "run_agent", "zvec_grep_tool",
-    "Harness", "TaskRequest", "RunResult", "RunStatus", "CheckSpec", "Profile",
+    "Harness", "TaskRequest", "RunResult", "RunStatus", "CheckSpec", "Profile", "EvidencePackage",
 ]
