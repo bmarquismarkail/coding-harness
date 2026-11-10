@@ -383,7 +383,7 @@ class InvestigationTests(unittest.TestCase):
 
                     class Provider:
                         def invoke(self, messages, *, role):
-                            return '{}' if role == 'reviewer' else json.dumps(next(actions))
+                            return '{"findings":[]}' if role == 'reviewer' else json.dumps(next(actions))
 
                     Engine(harness.store, rid, Provider()).execute()
                     review = harness.result(rid).review
@@ -518,7 +518,7 @@ class InvestigationTests(unittest.TestCase):
                 class Provider:
                     def invoke(self, messages, *, role):
                         """Replay the selected reads and return an empty independent review."""
-                        return '{}' if role == 'reviewer' else json.dumps(next(actions))
+                        return '{"findings":[]}' if role == 'reviewer' else json.dumps(next(actions))
 
                 Engine(harness.store, rid, Provider()).execute()
                 review = harness.result(rid).review
@@ -528,6 +528,63 @@ class InvestigationTests(unittest.TestCase):
                                  ['src/read.py', 'src/unread.py'] if covered else ['src/read.py'])
                 self.assertEqual(review.completion, 'completed' if covered else 'partial')
                 self.assertEqual(review.partial_reasons, [] if covered else ['unexamined_scope'])
+
+    def test_independent_reviewer_requires_an_explicit_report(self):
+        replies = {
+            'schema echo': '{"$defs":{"EvidenceChallenge":{"type":"object"}}}',
+            'empty object': '{}',
+            'unknown field': '{"findings":[],"unexpected":[]}',
+            'invalid field value': '{"findings":{}}',
+            'invalid nested type': json.dumps({'findings': [dict(
+                id='value', title='Value', claim='Check value', path='value.py', start_line='1')]}),
+            'malformed JSON': '{"findings":',
+            'non-object': '[]',
+            'explicit empty report': '{"findings":[]}',
+        }
+        for case, reply in replies.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / 'source'
+                source.mkdir()
+                (source / 'value.py').write_text('value = 1\n')
+                harness = Harness(root / 'state', autostart=False)
+                run_id = harness.submit(TaskRequest(root=str(source), task='Review value', mode='review',
+                                                    focus_paths=['value.py']))
+                actions = iter([
+                    {'type': 'tool', 'tool': 'read_file', 'args': {'path': 'value.py'}},
+                    {'type': 'finish', 'summary': 'Finished review'},
+                ])
+
+                class Provider:
+                    reviewer_calls = 0
+
+                    def invoke(self, messages, *, role):
+                        if role == 'reviewer':
+                            self.reviewer_calls += 1
+                            return reply
+                        return json.dumps(next(actions))
+
+                provider = Provider()
+                Engine(harness.store, run_id, provider).execute()
+                self.assertEqual(harness.status(run_id).state, 'completed')
+                self.assertEqual(provider.reviewer_calls, 1)
+                result = harness.result(run_id)
+                self.assertEqual(result.review.coverage.examined_paths, ['value.py'])
+                events = harness.events(run_id)['items']
+                failures = [event for event in events if event['kind'] == 'review_protocol_failure']
+                accepted = [event for event in events if event['kind'] == 'independent_model_review']
+                if case == 'explicit empty report':
+                    self.assertEqual(result.review.completion, 'completed')
+                    self.assertFalse(failures)
+                    self.assertEqual(len(accepted), 1)
+                else:
+                    self.assertEqual(result.review.completion, 'partial')
+                    self.assertEqual(result.review.partial_reasons, ['protocol_failure'])
+                    self.assertTrue(any(gap.startswith('Invalid reviewer response:') for gap in result.gaps))
+                    self.assertFalse(accepted)
+                    self.assertEqual(len(failures), 1)
+                    raw = harness.artifact(run_id, failures[0]['data']['artifact_id'])
+                    self.assertEqual(raw['content'], reply)
 
     def test_transitive_discovery_mode_changes_and_cancellation(self):
         from coding_agent.workspace import Workspace
@@ -557,7 +614,7 @@ class InvestigationTests(unittest.TestCase):
                     calls = 0
                     def invoke(self, messages, *, role):
                         if role == 'reviewer':
-                            return '{}'
+                            return '{"findings":[]}'
                         self.calls += 1
                         if self.calls == 1:
                             return json.dumps({'type': 'tool', 'tool': 'report_findings', 'args': {'findings': [
@@ -666,7 +723,7 @@ class ProgressAcceptanceTests(unittest.TestCase):
                 class Provider:
                     calls = 0
                     def invoke(self, messages, *, role):
-                        if role == 'reviewer': return '{}'
+                        if role == 'reviewer': return '{"findings":[]}'
                         self.calls += 1
                         if self.calls <= 8:
                             args = {'path': 'target.py', 'start': self.calls, 'lines': 1} if relevant else {'path': f'other{self.calls-1}.py'}

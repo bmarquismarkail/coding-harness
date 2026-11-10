@@ -71,6 +71,8 @@ class RepairProvider:
         self.content = content
 
     def invoke(self, messages, *, role):
+        if role == "reviewer":
+            return '{"findings":[]}'
         if role == "subagent":
             self.worker_calls += 1
             return json.dumps({"type": "finish", "summary": "Reviewed scoped candidate", "findings": [], "gaps": []})
@@ -112,6 +114,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result.evidence.diagnosis_sources)
         self.assertEqual(result.evidence.patch_source_hash,
                          next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
+
+    def test_invalid_independent_review_blocks_verified_repair(self):
+        class SchemaEchoProvider(RepairProvider):
+            def invoke(self, messages, *, role):
+                if role == "reviewer":
+                    return '{"$defs":{"EvidenceChallenge":{"type":"object"}}}'
+                return super().invoke(messages, role=role)
+
+        run_id = self.harness.submit(request(self.source))
+        Engine(self.harness.store, run_id, SchemaEchoProvider()).execute()
+        self.assertEqual(self.harness.status(run_id).state, "completed")
+        result = self.harness.result(run_id)
+        self.assertTrue(result.evidence.verification_checks)
+        self.assertTrue(all(check["passed"] for check in result.evidence.verification_checks))
+        self.assertEqual(result.outcome, "unverified")
+        self.assertEqual(result.review.completion, "partial")
+        self.assertIn("protocol_failure", result.review.partial_reasons)
+        self.assertTrue(any(gap.startswith("Invalid reviewer response:") for gap in result.gaps))
 
     def test_unscanned_inventory_does_not_block_verified_repair(self):
         unrelated = [f"filler_{number:03}.cpp" for number in range(500)]
@@ -299,6 +319,8 @@ else: raise AssertionError("dependency was writable")
         class Provider:
             def __init__(self): self.calls = 0
             def invoke(self, messages, *, role):
+                if role == "reviewer":
+                    return '{"findings":[]}'
                 self.calls += 1
                 if self.calls >= 8:
                     self.assert_boundary(messages)
@@ -344,6 +366,8 @@ class CheckpointTests(unittest.TestCase):
                 def __init__(self):
                     self.main = 0; self.calls = {}; self.lock = threading.Lock()
                 def invoke(self, messages, *, role):
+                    if role == "reviewer":
+                        return '{"findings":[]}'
                     if role == "main":
                         self.main += 1
                         if self.main == 1:

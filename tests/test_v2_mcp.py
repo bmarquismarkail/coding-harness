@@ -43,7 +43,9 @@ class ModelServer:
                     owner.release.wait(15)
                 answered = any('"user_answer"' in s for s in contents)
                 action = {"type":"finish","summary":"Scoped review completed","findings":[],"gaps":[]}
-                if "TASK: question" in "\n".join(contents) and not answered:
+                if self.path == "/reviewer/v1/chat/completions":
+                    action = {"findings": []}
+                elif "TASK: question" in "\n".join(contents) and not answered:
                     action = {"type":"input","question":"Which compatibility target should this review use?"}
                 raw = json.dumps({"choices":[{"finish_reason":"stop","message":{"content":json.dumps(action)}}]}).encode()
                 try:
@@ -76,8 +78,9 @@ class MCPAcceptance(unittest.IsolatedAsyncioTestCase):
         self.source=self.root/"source"; fixture(self.source)
         self.model=ModelServer(); self.env={**os.environ,"LLAMA_API_KEY":"fixture-model-key","HARNESS_MCP_API_KEY":"fixture-mcp-key","PYTHONDONTWRITEBYTECODE":"1"}
         config=json.loads((Path(__file__).resolve().parents[1]/"agent-config.json").read_text())
-        for role in ("main","subagents"):
+        for role in ("main","subagents","reviewer"):
             config[role]["base_url"]=f"http://127.0.0.1:{self.model.server.server_port}/{role}/v1"
+            config[role]["api_key_env"]="LLAMA_API_KEY"
         self.config=self.root/"config.json"; self.config.write_text(json.dumps(config))
         self.state=self.root/"state"; self.harness=Harness(self.state,config_path=self.config,autostart=False)
         self.processes=[]
@@ -149,6 +152,7 @@ class MCPAcceptance(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.wait_state(slow,{"cancelled","failed"})).state,"cancelled")
             self.assertEqual((await self.call(client,"result",run_id=slow))["outcome"],"cancelled")
         self.assertTrue(self.model.requests)
+        self.assertTrue(any(path == "/reviewer/v1/chat/completions" for path, _, _ in self.model.requests))
         self.assertTrue(all(auth=="Bearer fixture-model-key" for _,auth,_ in self.model.requests))
 
     async def test_stdio_real_client_survives_disconnect_resume_and_cancel(self):

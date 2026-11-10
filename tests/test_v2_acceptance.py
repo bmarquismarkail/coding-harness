@@ -48,6 +48,8 @@ class AcceptanceTests(unittest.TestCase):
             class Provider:
                 def __init__(self): self.calls=0
                 def invoke(self,messages,*,role):
+                    if role=="reviewer":
+                        return '{"findings":[]}'
                     if role=="subagent":
                         return '{"type":"finish","summary":"Reviewed C repair","findings":[],"gaps":[]}'
                     self.calls+=1
@@ -68,7 +70,7 @@ class AcceptanceTests(unittest.TestCase):
             req = cpp_fixture(source)
             class Provider(RepairProvider):
                 def invoke(self, messages, *, role):
-                    if role == "subagent":
+                    if role != "main":
                         return super().invoke(messages, role=role)
                     self.main_calls += 1
                     if self.main_calls == 1:
@@ -170,6 +172,8 @@ class AcceptanceTests(unittest.TestCase):
             run_id=harness.submit(TaskRequest(root=str(source),task="Review the plugin registration source",mode="review"))
             class FalsePositive:
                 def invoke(self,messages,*,role):
+                    if role=="reviewer":
+                        return '{"findings":[]}'
                     return json.dumps({"type":"finish","summary":"Model claims confirmed defects", "findings":[
                         {"title":title,"classification":"confirmed_gap"} for title in rejected],"gaps":[]})
             Engine(harness.store,run_id,FalsePositive()).execute()

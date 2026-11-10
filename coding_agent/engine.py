@@ -492,20 +492,29 @@ class Engine:
 
     def independent_review(self, summary: str, findings: list[dict], gaps: list[str]) -> tuple[list[dict], list[str]]:
         view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=self.profile.worker_context_bytes // 2)
-        prompt = [{"role": "system", "content": "Challenge conclusions using authoritative evidence. Return JSON matching "
+        prompt = [{"role": "system", "content": "Challenge conclusions using authoritative evidence. "
+                   'Return a review object with at least one report field. For an empty report, return {"findings": []}. '
+                   "The review object must match this schema: "
                    + json.dumps(ReviewerResponse.model_json_schema())},
                   {"role": "user", "content": json.dumps({"task": self.request.task, "summary": summary,
                     "findings": findings, "gaps": gaps, "evidence_view": {"view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()}})}]
         request_id = self.store.artifact(self.run_id, prompt)
         try:
             raw = self.provider.invoke(prompt, role="reviewer")
-            response_id = self.store.artifact(self.run_id, raw)
-            self.store.event(self.run_id, "independent_model_review", {"request_artifact": request_id, "response_artifact": response_id})
-            return self.evaluate_review(json.loads(raw))
         except Exception as exc:
             message = f"Independent reviewer unavailable: {type(exc).__name__}: {exc}"
             self.store.event(self.run_id, "independent_model_review_failed", {"error": message[:1000]})
             return [], [message]
+        response_id = self.store.artifact(self.run_id, raw)
+        try:
+            response = ReviewerResponse.model_validate_json(raw, strict=True)
+            if not response.model_fields_set:
+                raise ValueError("expected at least one explicit review field")
+        except ValueError as exc:
+            self.store.event(self.run_id, "review_protocol_failure", {"request_artifact": request_id, "artifact_id": response_id})
+            return [], [f"Invalid reviewer response: {exc}"]
+        self.store.event(self.run_id, "independent_model_review", {"request_artifact": request_id, "response_artifact": response_id})
+        return self.evaluate_review(response.model_dump())
 
     def execute(self):
         try:
