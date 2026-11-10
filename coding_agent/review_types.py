@@ -100,6 +100,13 @@ class ReviewerResponse(Contract):
     semantic_concerns: list[str] = Field(default_factory=list)
 
 
+class LiveReviewerResponse(ReviewerResponse):
+    findings: list[FindingProposal] = Field()
+    observations: list[str] = Field()
+    challenges: list[EvidenceChallenge] = Field()
+    semantic_concerns: list[str] = Field()
+
+
 class AdjudicatedFinding(Contract):
     proposal: FindingProposal
     status: Literal['hypothesis', 'reproduced', 'needs_human_review'] = 'hypothesis'

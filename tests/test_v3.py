@@ -16,6 +16,7 @@ from coding_agent.review_types import DefectProbeSpec, FindingProposal, ReviewDe
 from coding_agent.types import Profile, RunResult
 from coding_agent.tools import ReadArgs
 from coding_agent.workspace import tree_hash
+from test_v2 import EMPTY_REVIEW_JSON
 
 FIXTURE = Path(__file__).parent / 'fixtures/cpp-8uqnat7r'
 
@@ -102,9 +103,39 @@ class EvidenceTests(unittest.TestCase):
             def invoke(self, messages, *, role):
                 assert role == 'reviewer'
                 assert 'evidence_view' in messages[1]['content']
-                return json.dumps({'challenges': [{'kind': 'check_missing', 'check_id': 'acceptance', 'phase': 'candidate'}]})
+                return json.dumps({**json.loads(EMPTY_REVIEW_JSON), 'challenges': [
+                    {'kind': 'check_missing', 'check_id': 'acceptance', 'phase': 'candidate'}]})
         self.engine.provider = Reviewer()
         findings, gaps = self.engine.independent_review('Repair', [], [])
+        self.assertFalse(findings or gaps)
+
+    def test_live_review_gates_archived_cpp_repair(self):
+        self.engine.bundle, self.engine.bundle_id = self.bundle()
+        replies = ((EMPTY_REVIEW_JSON, 'verified'), ('{}', 'unverified'),
+                   ('{"error":"review could not be performed"}', 'unverified'),
+                   ('{"findings":[]}', 'unverified'))
+        for event_count, (reply, outcome) in enumerate(replies, start=1):
+            with self.subTest(reply=reply):
+                with patch.object(self.engine, 'provider') as provider:
+                    provider.invoke.return_value = reply
+                    findings, gaps = self.engine.independent_review('Repair', [], [])
+                    provider.invoke.assert_called_once()
+                    prompt = provider.invoke.call_args.args[0][0]['content']
+                    schema = json.loads(prompt.split('must match this schema: ', 1)[1])
+                self.assertFalse(findings)
+                self.assertEqual(self.finish(gaps).outcome, outcome)
+                self.assertEqual(set(schema.get('required', [])), set(json.loads(EMPTY_REVIEW_JSON)))
+                events = self.harness.events(self.rid)['items']
+                review_events = [e for e in events if e['kind'] in {
+                    'independent_model_review', 'review_protocol_failure'}]
+                self.assertEqual(len(review_events), event_count)
+                event = review_events[-1]
+                if outcome == 'unverified':
+                    self.assertEqual(event['kind'], 'review_protocol_failure')
+                    artifact = self.harness.artifact(self.rid, event['data']['artifact_id'])
+                    self.assertEqual(artifact['content'], reply)
+        findings, gaps, _ = adjudicate_response(self.harness.store, self.engine.bundle,
+                                                self.engine.bundle_id, {})
         self.assertFalse(findings or gaps)
 
     def test_projection_omissions_do_not_change_bundle(self):
@@ -383,7 +414,7 @@ class InvestigationTests(unittest.TestCase):
 
                     class Provider:
                         def invoke(self, messages, *, role):
-                            return '{"findings":[]}' if role == 'reviewer' else json.dumps(next(actions))
+                            return EMPTY_REVIEW_JSON if role == 'reviewer' else json.dumps(next(actions))
 
                     Engine(harness.store, rid, Provider()).execute()
                     review = harness.result(rid).review
@@ -518,7 +549,7 @@ class InvestigationTests(unittest.TestCase):
                 class Provider:
                     def invoke(self, messages, *, role):
                         """Replay the selected reads and return an empty independent review."""
-                        return '{"findings":[]}' if role == 'reviewer' else json.dumps(next(actions))
+                        return EMPTY_REVIEW_JSON if role == 'reviewer' else json.dumps(next(actions))
 
                 Engine(harness.store, rid, Provider()).execute()
                 review = harness.result(rid).review
@@ -533,13 +564,13 @@ class InvestigationTests(unittest.TestCase):
         replies = {
             'schema echo': '{"$defs":{"EvidenceChallenge":{"type":"object"}}}',
             'empty object': '{}',
-            'unknown field': '{"findings":[],"unexpected":[]}',
-            'invalid field value': '{"findings":{}}',
-            'invalid nested type': json.dumps({'findings': [dict(
+            'unknown field': json.dumps({**json.loads(EMPTY_REVIEW_JSON), 'unexpected': []}),
+            'invalid field value': json.dumps({**json.loads(EMPTY_REVIEW_JSON), 'findings': {}}),
+            'invalid nested type': json.dumps({**json.loads(EMPTY_REVIEW_JSON), 'findings': [dict(
                 id='value', title='Value', claim='Check value', path='value.py', start_line='1')]}),
             'malformed JSON': '{"findings":',
             'non-object': '[]',
-            'explicit empty report': '{"findings":[]}',
+            'explicit empty report': EMPTY_REVIEW_JSON,
         }
         for case, reply in replies.items():
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
@@ -614,7 +645,7 @@ class InvestigationTests(unittest.TestCase):
                     calls = 0
                     def invoke(self, messages, *, role):
                         if role == 'reviewer':
-                            return '{"findings":[]}'
+                            return EMPTY_REVIEW_JSON
                         self.calls += 1
                         if self.calls == 1:
                             return json.dumps({'type': 'tool', 'tool': 'report_findings', 'args': {'findings': [
@@ -723,7 +754,7 @@ class ProgressAcceptanceTests(unittest.TestCase):
                 class Provider:
                     calls = 0
                     def invoke(self, messages, *, role):
-                        if role == 'reviewer': return '{"findings":[]}'
+                        if role == 'reviewer': return EMPTY_REVIEW_JSON
                         self.calls += 1
                         if self.calls <= 8:
                             args = {'path': 'target.py', 'start': self.calls, 'lines': 1} if relevant else {'path': f'other{self.calls-1}.py'}

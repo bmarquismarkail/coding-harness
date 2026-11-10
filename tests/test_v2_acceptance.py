@@ -15,7 +15,7 @@ from coding_agent import CheckSpec, Harness, TaskRequest
 from coding_agent.engine import Engine
 from coding_agent.tools import Change, CommandArgs, PatchArgs, ReadArgs
 from coding_agent.workspace import digest, tree_hash
-from test_v2 import BAD, GOOD, RepairProvider, cited_source, fixture, request
+from test_v2 import EMPTY_REVIEW_JSON, BAD, GOOD, RepairProvider, cited_source, fixture, request
 
 CPP_BAD = "inline int clamp_level(int v) { if (v < 0) return 0; if (v > 100) return 99; return v; }\n"
 CPP_GOOD = CPP_BAD.replace("return 99", "return 100")
@@ -49,7 +49,7 @@ class AcceptanceTests(unittest.TestCase):
                 def __init__(self): self.calls=0
                 def invoke(self,messages,*,role):
                     if role=="reviewer":
-                        return '{"findings":[]}'
+                        return EMPTY_REVIEW_JSON
                     if role=="subagent":
                         return '{"type":"finish","summary":"Reviewed C repair","findings":[],"gaps":[]}'
                     self.calls+=1
@@ -173,7 +173,7 @@ class AcceptanceTests(unittest.TestCase):
             class FalsePositive:
                 def invoke(self,messages,*,role):
                     if role=="reviewer":
-                        return '{"findings":[]}'
+                        return EMPTY_REVIEW_JSON
                     return json.dumps({"type":"finish","summary":"Model claims confirmed defects", "findings":[
                         {"title":title,"classification":"confirmed_gap"} for title in rejected],"gaps":[]})
             Engine(harness.store,run_id,FalsePositive()).execute()

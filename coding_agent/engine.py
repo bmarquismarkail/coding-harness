@@ -14,13 +14,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from .checks import Checks
-from .evidence import freeze_bundle, reviewer_view, adjudicate_response, read_json
-from .review_types import ReviewDetails, Coverage, ReviewerResponse, FindingProposal
+from .evidence import freeze_bundle, reviewer_view, adjudicate_response, read_json, recover_partial_review
+from .review_types import ReviewDetails, Coverage, LiveReviewerResponse, FindingProposal
 from .investigation import discover_scope, evidence_progress
 from .config import AgentConfig
 from .profiles import configured_models
 from .project_profiles import skill_context, skill_metadata
-from .runtime_model import RecordingProvider
+from .runtime_model import RecordingProvider, RecoverableResponseError
 from .sandbox import SandboxError, SandboxRunner
 from .store import Store
 from .tools import EvidenceArgs, ListArgs, ReadArgs, ToolBroker, WorkerTask
@@ -30,6 +30,10 @@ from .zvec import ZvecGrepSettings, ZvecGrepTool
 
 
 class SpecialistFailure(RuntimeError):
+    pass
+
+
+class SpecialistProtocolExhausted(SpecialistFailure):
     pass
 
 
@@ -163,16 +167,26 @@ class SpecialistPool:
             data["messages"] = [{"role": "system", "content": instructions(broker, specialist=True, skills=e.skills)},
                                 {"role": "user", "content": task.task+"\n"+seed}]
         try:
-            while data["step"] < e.profile.worker_max_actions:
+            while data.get("protocol_failures", 0) < e.profile.protocol_failure_limit:
                 e.guard()
+                response_error = None
                 if data["messages"][-1]["role"] == "assistant":
                     raw = data["messages"][-1]["content"]
                 else:
-                    raw = e.provider.invoke(bounded_messages(data["messages"], e.profile.worker_context_bytes), role="subagent")
+                    if data["step"] >= e.profile.worker_max_actions:
+                        raise SpecialistFailure("specialist action budget exhausted")
+                    try:
+                        raw = e.provider.invoke(bounded_messages(data["messages"], e.profile.worker_context_bytes), role="subagent")
+                    except RecoverableResponseError as exc:
+                        response_error = exc
+                    else:
+                        data["messages"].append({"role": "assistant", "content": raw})
                     data["step"] += 1
-                    data["messages"].append({"role": "assistant", "content": raw})
-                    self.save(key, "running", data)
+                    if response_error is None:
+                        self.save(key, "running", data)
                 try:
+                    if response_error is not None:
+                        raise response_error
                     action = parse_action(raw)
                     if isinstance(action, FinishAction):
                         data["result"] = {"id": task.id, **action.model_dump(), "source_hash": data["source_hash"]}
@@ -191,15 +205,14 @@ class SpecialistPool:
                         raise ValueError("specialists must finish or use their read-only tools")
                     result = broker.invoke(action.tool, action.args, key=f"worker:{key}:{data['step']}")
                     data["protocol_failures"] = 0
-                except (ValueError, PermissionError, OSError) as exc:
+                except InterruptedError:
+                    raise
+                except (RecoverableResponseError, ValueError, PermissionError, OSError) as exc:
                     result = {"error": str(exc)}
                     data["protocol_failures"] = data.get("protocol_failures", 0) + 1
-                if data.get("protocol_failures", 0) >= e.profile.protocol_failure_limit:
-                    self.save(key, "running", data)
-                    raise SpecialistFailure("specialist protocol recovery exhausted")
                 data["messages"].append({"role": "user", "content": json.dumps(result)})
                 self.save(key, "running", data)
-            raise SpecialistFailure("specialist action budget exhausted")
+            raise SpecialistProtocolExhausted("specialist protocol recovery exhausted")
         except Exception as exc:
             data["error"] = str(exc)
             self.save(key, "failed", data)
@@ -223,6 +236,8 @@ class SpecialistPool:
                 row = next(r for r in reversed(self.rows()) if r["data"]["task"]["id"] == identity)
                 try:
                     self.futures[row["key"]].result()
+                except (InterruptedError, SpecialistProtocolExhausted):
+                    raise
                 except Exception as exc:
                     raise SpecialistFailure(f"specialist {identity} failed: {exc}") from exc
                 row = next(r for r in self.rows() if r["key"] == row["key"])
@@ -311,15 +326,23 @@ class Engine:
         """Build the checkpointed model, tool, and finalization loop."""
         def model(state):
             self.guard()
-            raw = self.provider.invoke(bounded_messages(state["messages"], self.profile.main_context_bytes), role="main")
-            messages = [*state["messages"], {"role": "assistant", "content": raw}]
+            messages = list(state["messages"])
             failures = state.get("protocol_failures", 0)
             try:
-                action = parse_action(raw).model_dump()
-            except ValueError as exc:
+                raw = self.provider.invoke(bounded_messages(messages, self.profile.main_context_bytes), role="main")
+            except RecoverableResponseError as exc:
+                error = exc
+            else:
+                messages.append({"role": "assistant", "content": raw})
+                try:
+                    action = parse_action(raw).model_dump()
+                    error = None
+                except ValueError as exc:
+                    error = exc
+            if error is not None:
                 failures += 1
                 action = {"type": "invalid"}
-                messages.append({"role": "user", "content": f"Invalid action: {str(exc)[:1200]}. "
+                messages.append({"role": "user", "content": f"Invalid action: {str(error)[:1200]} "
                                  'Use {"type":"tool","tool":"read_file","args":{"path":"your_file"}} for a tool. '
                                  'Use {"type":"finish","summary":"...","findings":[],"gaps":[]} only after completing work. '
                                  'Every finding must be an object, for example {"title":"hypothesis"}.'})
@@ -457,7 +480,8 @@ class Engine:
             failed_checks = [r["data"] for r in self.store.receipts(self.run_id, "check")
                              if r["state"] == "completed" and r["data"].get("phase") == "candidate"
                              and not r["data"].get("passed") and r["data"].get("source_hash") == tree_hash(self.workspace.root)]
-            if self.request.mode == "implement" and failed_checks and attempts < 3 and self.store.status(self.run_id).actions < self.profile.max_actions-10:
+            if (self.request.mode == "implement" and "protocol_failure" not in state.get("partial_reasons", []) and failed_checks
+                    and attempts < 3 and self.store.status(self.run_id).actions < self.profile.max_actions-10):
                 feedback = {"finish_rejected": "Required checks still fail. Repair the candidate using these runtime observations before finishing again.",
                             "gaps": result.gaps, "failed_checks": [{k:v for k,v in c.items() if k != "output"} for c in failed_checks[-5:]],
                             "outputs": [c.get("output", "")[-1800:] for c in failed_checks[-3:]]}
@@ -493,23 +517,24 @@ class Engine:
     def independent_review(self, summary: str, findings: list[dict], gaps: list[str]) -> tuple[list[dict], list[str]]:
         view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=self.profile.worker_context_bytes // 2)
         prompt = [{"role": "system", "content": "Challenge conclusions using authoritative evidence. "
-                   'Return a review object with at least one report field. For an empty report, return {"findings": []}. '
+                   'Return all four report arrays. For an empty report, return '
+                   '{"findings":[],"observations":[],"challenges":[],"semantic_concerns":[]}. '
                    "The review object must match this schema: "
-                   + json.dumps(ReviewerResponse.model_json_schema())},
+                   + json.dumps(LiveReviewerResponse.model_json_schema())},
                   {"role": "user", "content": json.dumps({"task": self.request.task, "summary": summary,
                     "findings": findings, "gaps": gaps, "evidence_view": {"view_id": self.store.artifact(self.run_id, view.model_dump()), **view.model_dump()}})}]
         request_id = self.store.artifact(self.run_id, prompt)
         try:
             raw = self.provider.invoke(prompt, role="reviewer")
+        except InterruptedError:
+            raise
         except Exception as exc:
             message = f"Independent reviewer unavailable: {type(exc).__name__}: {exc}"
             self.store.event(self.run_id, "independent_model_review_failed", {"error": message[:1000]})
             return [], [message]
         response_id = self.store.artifact(self.run_id, raw)
         try:
-            response = ReviewerResponse.model_validate_json(raw, strict=True)
-            if not response.model_fields_set:
-                raise ValueError("expected at least one explicit review field")
+            response = LiveReviewerResponse.model_validate_json(raw, strict=True)
         except ValueError as exc:
             self.store.event(self.run_id, "review_protocol_failure", {"request_artifact": request_id, "artifact_id": response_id})
             return [], [f"Invalid reviewer response: {exc}"]
@@ -543,7 +568,7 @@ class Engine:
                     initial = {"step": 0, "messages": [
                         {"role": "system", "content": instructions(self.broker, skills=self.skills)},
                         {"role": "user", "content": f"MODE: {self.request.mode}; TASK TYPE: {self.request.task_type}\nTASK: {self.request.task}\n"+self.seed(self.broker, scopes=self.request.focus_paths)}]}
-                outcome = graph.invoke(initial, config)
+                outcome = graph.invoke(initial, config, durability="sync")
                 if outcome.get("__interrupt__"):
                     question = outcome["__interrupt__"][0].value
                     self.store.event(self.run_id, "question", question)
@@ -563,6 +588,9 @@ class Engine:
             self.store.transition(self.run_id, "cancelled", error=str(exc), result=self.partial_result("cancelled", str(exc)))
         except SandboxError as exc:
             self.store.transition(self.run_id, "failed", error=str(exc), result=self.partial_result("failed", str(exc)))
+        except SpecialistProtocolExhausted as exc:
+            self.store.transition(self.run_id, "interrupted", error=str(exc),
+                                  result=self.partial_result("unverified", str(exc), partial_reason="protocol_failure"))
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
             self.store.transition(self.run_id, "interrupted", error=reason,
@@ -571,7 +599,7 @@ class Engine:
             self.stop.set()
             self.pool.close()
 
-    def partial_result(self, outcome, reason):
+    def partial_result(self, outcome, reason, *, partial_reason=None):
         from .types import EvidencePackage, RunResult
         patch = self.workspace.patch() if (self.workspace.folder / "baseline.index").exists() else ""
         checks = [{**r["data"], "receipt_state":r["state"]} for r in self.store.receipts(self.run_id, "check")]
@@ -585,23 +613,12 @@ class Engine:
                                   patch_artifact=self.store.artifact(self.run_id, patch), patch_source_hash=current_hash,
                                   verification_checks=verification, remaining_gaps=["Execution stopped before the workflow and verification completed."],
                                   skill_snapshots=self.skill_snapshots)
-        partial_findings = []
-        bundle_id = None
-        partial_errors = []
-        if (self.workspace.folder / "workspace.json").exists() and self.checks.path.exists():
-            try:
-                bundle, bundle_id = freeze_bundle(self, self.coverage)
-                for receipt in self.store.receipts(self.run_id, "draft_findings"):
-                    raw = read_json(self.store, self.run_id, receipt["data"]["artifact_id"])
-                    found, _, _ = adjudicate_response(self.store, bundle, bundle_id, raw)
-                    partial_findings.extend(found)
-            except (ValueError, OSError, KeyError) as exc:
-                partial_errors.append(f"Partial evidence could not be adjudicated: {exc}")
-        package.remaining_gaps.extend(partial_errors)
-        partial_reason = "budget_exhausted" if "budget" in reason else "interrupted"
+        partial_reason = partial_reason or ("budget_exhausted" if "budget" in reason else "interrupted")
+        review, evidence_gaps = recover_partial_review(
+            self.store, self.run_id, self.workspace, self.revision, partial_reason, self.coverage)
+        package.remaining_gaps.extend(evidence_gaps)
         return RunResult(run_id=self.run_id, outcome=outcome, summary=reason, patch=patch,
-                         review=ReviewDetails(completion="partial", partial_reasons=[partial_reason],
-                             findings=partial_findings, bundle_id=bundle_id, coverage=self.coverage),
+                         review=review,
                          patch_artifact=self.store.artifact(self.run_id, patch),
                          checks=[{k:v for k,v in c.items() if k != "output"} for c in checks],
                          evidence_ids=sorted({c["artifact_id"] for c in checks if c.get("artifact_id")}),

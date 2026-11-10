@@ -11,6 +11,12 @@ from .model import ModelError
 from .types import action_schema
 
 
+class RecoverableResponseError(ModelError):
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
 class RecordingProvider:
     def __init__(self, config, store, run_id, cancelled):
         self.config, self.store, self.run_id, self.cancelled = config, store, run_id, cancelled
@@ -27,17 +33,23 @@ class RecordingProvider:
         artifact = self.store.artifact(self.run_id, request)
         self.store.event(self.run_id, "model_started", {"role": role, "request_artifact": artifact})
         started = time.monotonic()
+        result_id = None
         try:
             body = asyncio.run(self._request(settings, messages, role))
             record = {"request_artifact": artifact, "response": body, "http_status": 200,
                       "elapsed_seconds": round(time.monotonic()-started, 3)}
             result_id = self.store.artifact(self.run_id, record)
             choice = body["choices"][0]
-            if choice.get("finish_reason") != "stop":
-                raise ModelError(f"model did not complete its response: {choice.get('finish_reason')}")
-            content = choice["message"]["content"]
-            if not isinstance(content, str) or not content.strip():
-                raise ModelError("model returned no final content")
+            finish_reason = choice.get("finish_reason")
+            if finish_reason == "length":
+                raise RecoverableResponseError("truncated", "Response reached the token limit. Return a shorter action.")
+            if finish_reason != "stop":
+                raise ModelError(f"model did not complete its response: {finish_reason}")
+            content = choice.get("message", {}).get("content")
+            if content is None or isinstance(content, str) and not content.strip():
+                raise RecoverableResponseError("empty_content", "Response had no final content. Return one complete action.")
+            if not isinstance(content, str):
+                raise ModelError("model returned non-text final content")
             self.store.event(self.run_id, "model_completed", {"role": role, "response_artifact": result_id,
                                                             "usage": body.get("usage", {})})
             return content
@@ -46,9 +58,16 @@ class RecordingProvider:
             for key in ("LLAMA_API_KEY", "OPENAI_API_KEY", "HARNESS_MCP_API_KEY"):
                 if os.environ.get(key):
                     message = message.replace(os.environ[key], "[redacted]")
-            self.store.event(self.run_id, "model_failed", {"role": role, "error": message, "request_artifact": artifact})
+            failure = {"role": role, "error": message, "request_artifact": artifact}
+            if result_id is not None:
+                failure["response_artifact"] = result_id
+            if isinstance(exc, RecoverableResponseError):
+                failure["category"] = exc.category
+            self.store.event(self.run_id, "model_failed", failure)
             if isinstance(exc, InterruptedError):
                 raise InterruptedError(message) from None
+            if isinstance(exc, RecoverableResponseError):
+                raise RecoverableResponseError(exc.category, message) from None
             raise ModelError(message) from None
 
     async def _request(self, settings, messages, role="main"):

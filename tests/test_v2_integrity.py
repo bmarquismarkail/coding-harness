@@ -122,6 +122,18 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual(result.outcome,"cancelled")
         self.assertIn("+    count = 0",result.patch)
 
+    def test_orphan_with_unreadable_patch_still_gets_terminal_result(self):
+        from coding_agent.supervisor import record_exit
+
+        (self.engine.workspace.folder / "baseline.index").write_bytes(b"invalid index")
+        self.harness.store.transition(self.run_id, "running")
+        record_exit(self.harness.store, self.run_id, "orphaned worker exited")
+        self.assertEqual(self.harness.status(self.run_id).state, "interrupted")
+        result = self.harness.result(self.run_id)
+        self.assertEqual(result.outcome, "unverified")
+        self.assertEqual(result.review.completion, "partial")
+        self.assertTrue(any("Partial patch could not be exported" in gap for gap in result.gaps))
+
     def test_status_and_artifacts_remain_readable_after_source_moves(self):
         key=self.harness.store.artifact(self.run_id,"retained")
         self.source.rename(self.root/"moved")

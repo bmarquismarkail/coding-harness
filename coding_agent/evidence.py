@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+from subprocess import CalledProcessError
 from .review_types import (ImmutableEvidenceBundle, ReviewerEvidenceView, ReviewerResponse,
                            FindingProposal, AdjudicatedFinding, ReviewDetails, Coverage)
 from .workspace import tree_hash, checked_path, digest
@@ -19,7 +20,11 @@ def read_json(store, run_id, artifact_id):
 
 def freeze_bundle(engine, coverage=None):
     """Persist source, patch, and check evidence and update coverage from valid reads."""
-    store, rid, workspace = engine.store, engine.run_id, engine.workspace
+    return _freeze_bundle(engine.store, engine.run_id, engine.workspace, engine.revision,
+                          engine.checks.definitions(), coverage)
+
+
+def _freeze_bundle(store, rid, workspace, revision, definitions, coverage):
     checks, sources, probes, gaps = [], [], [], []
     for receipt in store.receipts(rid, 'check'):
         data = receipt['data']
@@ -50,9 +55,9 @@ def freeze_bundle(engine, coverage=None):
     for receipt in store.receipts(rid, 'probe_definition'):
         artifact_id = receipt['data']['artifact_id']
         probes.append({'artifact_id': artifact_id, **read_json(store, rid, artifact_id)})
-    bundle = ImmutableEvidenceBundle(run_id=rid, revision=engine.revision,
+    bundle = ImmutableEvidenceBundle(run_id=rid, revision=revision,
         baseline_hash=tree_hash(workspace.baseline_check_root()), candidate_hash=tree_hash(workspace.root),
-        patch_artifact_id=store.artifact(rid, workspace.patch()), definitions=engine.checks.definitions(),
+        patch_artifact_id=store.artifact(rid, workspace.patch()), definitions=definitions,
         checks=checks, source_evidence=sources, defect_probes=probes,
         coverage=coverage or Coverage(), integrity_gaps=gaps)
     bundle.coverage.examined_paths = sorted({
@@ -65,6 +70,40 @@ def freeze_bundle(engine, coverage=None):
     artifact_id = store.artifact(rid, bundle.model_dump())
     store.event(rid, 'evidence_bundle', {'artifact_id': artifact_id})
     return bundle, artifact_id
+
+
+def recover_partial_review(store, run_id, workspace, revision, reason, coverage=None):
+    """Recover completed drafts using only the durable workspace and receipts."""
+    review = ReviewDetails(completion="partial", partial_reasons=[reason], coverage=coverage or Coverage())
+    gaps = []
+    checks_path = workspace.folder / "checks.json"
+    if not workspace.meta.exists() or not checks_path.exists():
+        return review, gaps
+    try:
+        bundle, review.bundle_id = _freeze_bundle(
+            store, run_id, workspace, revision, json.loads(checks_path.read_text()), review.coverage)
+        review.coverage = bundle.coverage
+    except (ValueError, OSError, KeyError, TypeError, CalledProcessError) as exc:
+        return review, [f"Partial evidence could not be adjudicated: {exc}"]
+
+    gaps.extend(bundle.integrity_gaps)
+    decisions = []
+    for receipt in store.receipts(run_id, "draft_findings"):
+        if receipt["state"] != "completed":
+            continue
+        try:
+            raw = read_json(store, run_id, receipt["data"]["artifact_id"])
+            if not isinstance(raw, dict) or not isinstance(raw.get("findings"), list):
+                raise ValueError("expected a draft findings array")
+            findings, draft_gaps, decision = adjudicate_response(store, bundle, review.bundle_id, raw)
+            review.findings.extend(findings)
+            gaps.extend(draft_gaps)
+            decisions.append(decision)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            gaps.append(f"Partial draft {receipt['key']} could not be adjudicated: {exc}")
+    if decisions:
+        review.adjudication_id = store.artifact(run_id, {"decisions": decisions})
+    return review, gaps
 
 
 def reviewer_view(store, bundle, bundle_id, budget=6000):

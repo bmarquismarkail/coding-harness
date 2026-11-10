@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 
+from .evidence import recover_partial_review
 from .store import Store
 from .types import EvidencePackage, RunResult
 from .workspace import Workspace
@@ -30,7 +31,9 @@ def record_exit(store, run_id, reason):
                 for r in records if r["data"].get("phase") == "baseline"]
     verification = [{k:r["data"].get(k) for k in ("check_id", "source_hash", "passed", "exit_code", "artifact_id", "skipped", "timed_out")}
                     for r in records if r["data"].get("phase") == "candidate"]
-    config = store.get(run_id)["config"]
+    config = current["config"]
+    review, evidence_gaps = recover_partial_review(store, run_id, workspace, config.get("_revision", 0), "interrupted")
+    gaps.extend(evidence_gaps)
     package = EvidencePackage(baseline_checks=baseline,
                               reproducer_artifacts=[r["data"]["artifact_id"] for r in records
                                                     if r["data"].get("phase") == "baseline" and r["data"].get("artifact_id")],
@@ -39,6 +42,7 @@ def record_exit(store, run_id, reason):
                               skill_snapshots=config.get("_skill_metadata", []))
     result = RunResult(run_id=run_id, outcome="cancelled" if state == "cancelled" else "unverified",
                        summary=reason, patch=patch, patch_artifact=store.artifact(run_id,patch),
+                       review=review,
                        checks=[{**{k:v for k,v in r['data'].items() if k != 'output'},"receipt_state":r['state']} for r in records],
                        evidence_ids=sorted({r["data"]["artifact_id"] for r in records if r["data"].get("artifact_id")}),
                        evidence=package,

@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from contextlib import AsyncExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,14 +23,21 @@ import httpx2
 from mcp import Client, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
-from coding_agent import Harness
+from coding_agent import Harness, CheckSpec
+from coding_agent.engine import Engine
+from coding_agent.evidence import read_json
+from coding_agent.review_types import DefectProbeSpec
+from coding_agent.workspace import Workspace, tree_hash
 from coding_agent.mcp_server import http_app
-from test_v2 import fixture
+from test_v2 import EMPTY_REVIEW_JSON, cited_source, fixture
 
 
 class ModelServer:
     def __init__(self):
         self.requests = []
+        self.scripts = {}
+        self.blocked = threading.Event()
+        self.writer_finished = threading.Event()
         self.release = threading.Event()
         owner = self
         class Handler(BaseHTTPRequestHandler):
@@ -44,10 +52,25 @@ class ModelServer:
                 answered = any('"user_answer"' in s for s in contents)
                 action = {"type":"finish","summary":"Scoped review completed","findings":[],"gaps":[]}
                 if self.path == "/reviewer/v1/chat/completions":
-                    action = {"findings": []}
+                    action = json.loads(EMPTY_REVIEW_JSON)
                 elif "TASK: question" in "\n".join(contents) and not answered:
                     action = {"type":"input","question":"Which compatibility target should this review use?"}
                 raw = json.dumps({"choices":[{"finish_reason":"stop","message":{"content":json.dumps(action)}}]}).encode()
+                role = self.path.split("/")[1]
+                script = owner.scripts.get(role)
+                if script:
+                    choice = script.popleft()
+                    if role == "main" and not script:
+                        owner.writer_finished.set()
+                    if role == "subagents":
+                        owner.writer_finished.wait(5)
+                    if callable(choice):
+                        choice = choice(data["messages"])
+                    if choice is None:
+                        owner.blocked.set()
+                        owner.release.wait(15)
+                    else:
+                        raw = json.dumps({"choices": [choice]}).encode()
                 try:
                     self.send_response(200); self.send_header("Content-Type","application/json")
                     self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
@@ -206,6 +229,168 @@ class MCPAcceptance(unittest.IsolatedAsyncioTestCase):
         await cli("resume",run_id,"--answer","Preserve the public API")
         self.assertEqual((await self.wait_state(run_id,{"completed","interrupted"})).state,"completed")
         self.assertEqual(await cli("result",run_id),self.harness.result(run_id).model_dump())
+
+    async def run_response_script(self, role, responses, *, max_requests=20, cancel=False):
+        self.model.requests.clear()
+        self.model.scripts.clear()
+        self.model.writer_finished.clear()
+        finish = {"type": "finish", "summary": "Done"}
+        draft = {"type": "tool", "tool": "report_findings", "args": {"findings": [
+            {"id": "latency", "title": "Inspect latency", "claim": "Possible issue", "path": "latency.py"}]}}
+
+        def choice(action):
+            return {"finish_reason": "stop", "message": {"content": json.dumps(action)}}
+
+        if role == "subagents":
+            delegate = {"type": "tool", "tool": "delegate", "args": {"tasks": [
+                {"id": "latency", "task": "Review latency", "paths": ["latency.py"]}]}}
+            self.model.scripts["main"] = deque(map(choice, [delegate, finish]))
+        self.model.scripts[role] = deque([choice(draft), *responses, choice(finish)])
+        self.harness.profiles["recovery"] = {"protocol_failure_limit": 2, "max_model_requests": max_requests}
+        rid = self.harness.submit({"root": str(self.source), "task": "Test response recovery", "mode": "review",
+                                   "profile": "recovery", "focus_paths": ["latency.py"]})
+        with patch.dict(os.environ, self.env):
+            execution = asyncio.create_task(asyncio.to_thread(Engine(self.harness.store, rid).execute))
+            if cancel:
+                try:
+                    self.assertTrue(await asyncio.to_thread(self.model.blocked.wait, 5))
+                    self.harness.cancel(rid)
+                finally:
+                    await asyncio.wait_for(execution, 10)
+            else:
+                await asyncio.wait_for(execution, 10)
+        return rid
+
+    async def test_loopback_recovers_response_failures_in_both_roles(self):
+        from coding_agent.qualification import report
+
+        read = {"finish_reason": "stop", "message": {"content": json.dumps({
+            "type": "tool", "tool": "read_file", "args": {"path": "latency.py"}})}}
+        cases = [
+            ("truncated", {"finish_reason": "length", "message": read["message"]}),
+            ("empty_content", {"finish_reason": "stop", "message": {}}),
+            ("empty_content", {"finish_reason": "stop", "message": {"content": None}}),
+            ("empty_content", {"finish_reason": "stop", "message": {"content": " \n "}}),
+        ]
+        attempts = []
+        for role in ("main", "subagents"):
+            for category, failure in cases:
+                with self.subTest(role=role, failure=failure):
+                    rid = await self.run_response_script(role, [failure, read])
+                    result = self.harness.result(rid)
+                    self.assertEqual(self.harness.status(rid).state, "completed")
+                    self.assertNotIn("protocol_failure", result.review.partial_reasons)
+                    events = self.harness.events(rid, limit=100)["items"]
+                    tools = [e["data"]["tool"] for e in events if e["kind"] == "tool"]
+                    self.assertEqual(tools.count("read_file"), 1)
+                    requests = [payload for path, _, payload in self.model.requests if path.startswith(f"/{role}/")]
+                    self.assertEqual(len(requests), 4)
+                    failures = [e["data"] for e in events if e["kind"] == "model_failed"]
+                    self.assertEqual([e["category"] for e in failures], [category])
+                    self.assertIn(failures[0]["error"], requests[2]["messages"][-1]["content"])
+                    artifact = self.harness.artifact(rid, failures[0]["response_artifact"])
+                    self.assertEqual(json.loads(artifact["content"])["response"]["choices"], [failure])
+                    self.assertEqual(self.harness.status(rid).model_requests, len(self.model.requests))
+                    attempts.append([False, True])
+        metrics = report({"protocol": attempts})["metrics"]
+        self.assertEqual(metrics["first_response"]["observed"], 0)
+        self.assertEqual(metrics["after_recovery"]["observed"], 1)
+
+    async def test_supervisor_recovers_drafts_after_worker_is_killed(self):
+        (self.source / "value.py").write_text("value = 99\n")
+        for case in ("valid", "missing", "stale", "cancelled"):
+            with self.subTest(case=case):
+                self.model.blocked.clear()
+                self.model.release.clear()
+                read = {"type": "tool", "tool": "read_file", "args": {"path": "value.py"}}
+
+                def choice(action):
+                    return {"finish_reason": "stop", "message": {"content": json.dumps(action)}}
+
+                def draft(messages):
+                    return choice({"type": "tool", "tool": "report_findings", "args": {"findings": [
+                        {"id": "upper", "title": "Upper bound", "claim": "Check value",
+                         "path": "value.py", "defect_id": "upper", "evidence_ids": cited_source(messages)}]}})
+
+                self.model.scripts = {"main": deque([choice(read), draft, None])}
+                probe = DefectProbeSpec(defect_id="upper", observation="The fixture returns 99.", check_id="probe",
+                    path="value.py", phase="candidate", source_hash=tree_hash(self.source),
+                    wrapper='from pathlib import Path\nimport sys\nsys.exit(42 if "99" in Path("value.py").read_text() else 0)\n',
+                    observed_exit_codes=[42], not_observed_exit_codes=[0])
+                with patch.dict(os.environ, self.env):
+                    service = Harness(self.state, config_path=self.config)
+                    rid = service.submit({"root": str(self.source), "task": "Review value", "mode": "review",
+                        "focus_paths": ["value.py"], "checks": [CheckSpec(id="probe", argv=["ignored"]).model_dump()],
+                        "defect_probes": [probe.model_dump()]})
+                try:
+                    self.assertTrue(await asyncio.to_thread(self.model.blocked.wait, 10))
+                    receipt, = service.store.receipts(rid, "draft_findings")
+                    if case == "missing":
+                        with service.store.db() as db:
+                            db.execute("DELETE FROM receipts WHERE run_id=? AND kind='check' "
+                                       "AND json_extract(data,'$.phase')='candidate'", (rid,))
+                    if case == "stale":
+                        workspace = Workspace(service.store.run_dir(rid))
+                        (workspace.root / "unrelated.txt").write_text("Changed candidate snapshot\n")
+                    # A corrupt draft must not hide the subsequent valid draft.
+                    with service.store.db() as db:
+                        db.execute("DELETE FROM receipts WHERE run_id=? AND key=?", (rid, receipt["key"]))
+                    service.store.save_receipt(rid, "broken-draft", "draft_findings", "completed",
+                                               {"artifact_id": "0"*64})
+                    service.store.save_receipt(rid, receipt["key"], receipt["kind"], receipt["state"], receipt["data"])
+                    checks = service.store.receipts(rid, "check")
+                    requests = len(self.model.requests)
+                    expected_engine = Engine(service.store, rid, object())
+                    try:
+                        expected = expected_engine.partial_result("unverified", "worker interrupted")
+                    finally:
+                        expected_engine.pool.close()
+                    if case == "cancelled":
+                        service.cancel(rid)
+                    pid = service.store.get(rid)["pid"]
+                    os.kill(pid, signal.SIGKILL)
+                    await self.wait_state(rid, {"cancelled" if case == "cancelled" else "interrupted"})
+                    result = service.result(rid)
+                    self.assertEqual(result.outcome, "cancelled" if case == "cancelled" else "unverified")
+                    self.assertEqual(result.review.completion, "partial")
+                    self.assertEqual([f.model_dump() for f in result.review.findings], expected["review"]["findings"])
+                    finding, = result.review.findings
+                    self.assertEqual(finding.status, "reproduced" if case in {"valid", "cancelled"} else "needs_human_review")
+                    self.assertTrue(finding.proposal.evidence_ids)
+                    for aid in finding.proposal.evidence_ids:
+                        source = read_json(service.store, rid, aid)
+                        self.assertEqual(source["path"], "value.py")
+                    read_json(service.store, rid, result.review.bundle_id)
+                    read_json(service.store, rid, result.review.adjudication_id)
+                    self.assertTrue(any("broken-draft" in gap for gap in result.gaps))
+                    self.assertEqual(service.store.receipts(rid, "check"), checks)
+                    self.assertEqual(len(self.model.requests), requests)
+                finally:
+                    self.model.release.set()
+
+    async def test_loopback_response_recovery_respects_terminal_boundaries(self):
+        length = {"finish_reason": "length", "message": {"content": ""}}
+        for role in ("main", "subagents"):
+            for boundary in ("protocol_failure", "budget_exhausted", "cancelled"):
+                with self.subTest(role=role, boundary=boundary):
+                    # The specialist shares the writer's delegation and finish requests.
+                    extra = 2 if role == "subagents" else 0
+                    responses = [length, length] if boundary == "protocol_failure" else [length]
+                    if boundary == "cancelled":
+                        self.model.blocked.clear()
+                        responses.append(None)
+                    limit = 2 + extra if boundary == "budget_exhausted" else 20
+                    rid = await self.run_response_script(role, responses, max_requests=limit,
+                                                         cancel=boundary == "cancelled")
+                    result = self.harness.result(rid)
+                    self.assertEqual(result.outcome, "cancelled" if boundary == "cancelled" else "unverified")
+                    self.assertEqual(result.review.completion, "partial")
+                    if boundary != "cancelled":
+                        self.assertIn(boundary, result.review.partial_reasons)
+                    self.assertEqual([f.proposal.id for f in result.review.findings], ["latency"])
+                    expected = 2 if boundary == "budget_exhausted" else 3
+                    self.assertEqual(sum(path.startswith(f"/{role}/") for path, _, _ in self.model.requests), expected)
+                    self.assertEqual(self.harness.status(rid).model_requests, len(self.model.requests))
 
     async def test_supervisor_admits_only_one_active_job(self):
         with patch.dict(os.environ,self.env):

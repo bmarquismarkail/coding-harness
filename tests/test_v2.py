@@ -24,6 +24,8 @@ from coding_agent.tools import Change, PatchArgs, ReadArgs, EvidenceArgs, ToolBr
 from coding_agent.types import Profile, parse_action
 from coding_agent.workspace import Workspace, digest
 
+EMPTY_REVIEW_JSON = '{"findings":[],"observations":[],"challenges":[],"semantic_concerns":[]}'
+
 BAD = 'def mean_latency(samples):\n    if not samples:\n        raise ValueError("empty")\n    return sum(samples) / len(samples)\n'
 GOOD = 'def mean_latency(samples):\n    total = 0\n    count = 0\n    for value in samples:\n        total += value\n        count += 1\n    if count == 0:\n        raise ValueError("empty")\n    return total / count\n'
 EXISTING = 'import unittest\nfrom latency import mean_latency\nclass Existing(unittest.TestCase):\n    def test_list(self):\n        self.assertEqual(mean_latency([10,20,30]),20)\n'
@@ -72,7 +74,7 @@ class RepairProvider:
 
     def invoke(self, messages, *, role):
         if role == "reviewer":
-            return '{"findings":[]}'
+            return EMPTY_REVIEW_JSON
         if role == "subagent":
             self.worker_calls += 1
             return json.dumps({"type": "finish", "summary": "Reviewed scoped candidate", "findings": [], "gaps": []})
@@ -320,7 +322,7 @@ else: raise AssertionError("dependency was writable")
             def __init__(self): self.calls = 0
             def invoke(self, messages, *, role):
                 if role == "reviewer":
-                    return '{"findings":[]}'
+                    return EMPTY_REVIEW_JSON
                 self.calls += 1
                 if self.calls >= 8:
                     self.assert_boundary(messages)
@@ -367,7 +369,7 @@ class CheckpointTests(unittest.TestCase):
                     self.main = 0; self.calls = {}; self.lock = threading.Lock()
                 def invoke(self, messages, *, role):
                     if role == "reviewer":
-                        return '{"findings":[]}'
+                        return EMPTY_REVIEW_JSON
                     if role == "main":
                         self.main += 1
                         if self.main == 1:
