@@ -1,6 +1,7 @@
 """Bounded dependency discovery and snapshot-aware progress accounting."""
 import re
 import time
+from collections import deque
 from pathlib import Path
 from .review_types import Coverage
 from .workspace import checked_path, paths
@@ -32,94 +33,140 @@ def discover_scope(workspace, profile, focus_paths=(), *, implementation=False,
     if not implementation and not focus_paths:
         seeds = sorted(available)
 
-    included = seeds[:profile.discovery_paths]
-    omitted = seeds[profile.discovery_paths:]
+    included = dict.fromkeys(seeds[:profile.discovery_paths])
+    omitted = set(seeds[profile.discovery_paths:])
     limit = 'paths' if omitted else None
+    scan_limit = None
     started = clock()
 
-    def stop():
-        nonlocal limit
-        if limit:
-            return True
+    def interrupted():
         if cancelled():
-            limit = 'cancelled'
-        elif clock() - started >= profile.discovery_seconds:
-            limit = 'seconds'
-        return limit is not None
+            return 'cancelled'
+        if clock() - started >= profile.discovery_seconds:
+            return 'seconds'
+        return None
 
     used = 0
     sources = {}
-    ordered = sorted(available, key=lambda path: (path not in included, path))
-    for path in ordered[:profile.discovery_paths]:
-        if stop():
-            break
+
+    def scan(path):
+        nonlocal used
+        if reason := interrupted():
+            return reason
+        if len(sources) >= profile.discovery_paths:
+            return 'paths'
         source = available[path]
         if used + source.stat().st_size > profile.discovery_bytes:
-            limit = 'bytes'
-            break
+            return 'bytes'
         raw = bytearray()
         with source.open('rb') as stream:
-            while not stop():
+            while True:
+                if reason := interrupted():
+                    return reason
                 chunk = stream.read(min(65536, profile.discovery_bytes - used + 1))
                 if not chunk:
                     break
                 used += len(chunk)
                 if used > profile.discovery_bytes:
-                    limit = 'bytes'
-                    break
+                    return 'bytes'
                 raw.extend(chunk)
-        if limit:
-            break
-        sources[path] = raw.decode(errors='replace')
+        text = raw.decode(errors='replace')
+        tokens = set(re.findall(r'[A-Za-z_][A-Za-z_0-9]*', text))
+        if reason := interrupted():
+            return reason
+        sources[path] = text, tokens
+        return None
 
-    names = {Path(p).stem for p in included}
+    names = {Path(path).stem for path in included}
     edges = set()
-    # Revisit cached source when new declarations or modules expand the scope.
-    changed = True
-    while changed and not stop():
-        changed = False
-        ordered_sources = sorted(sources, key=lambda path: (path not in included, path))
-        for path in ordered_sources:
-            if stop():
+    pending = deque(path for path in included if path in available)
+    background = iter(sorted(available))
+    unmatched = {}
+    revisit = False
+
+    def add_names(discovered):
+        nonlocal revisit
+        if not discovered <= names:
+            names.update(discovered)
+            revisit = True
+
+    def expand(path, related):
+        reason = interrupted()
+        for target in related:
+            if reason:
                 break
-            text = sources[path]
-            tokens = set(re.findall(r'[A-Za-z_][A-Za-z_0-9]*', text))
-            links = re.findall(r'(?:#\s*include\s*["<]([^">]+)|(?:from|import)\s+([\w.]+))', text)
-            related = []
-            if path in included:
-                declarations = re.findall(r'\bdef\s+([A-Za-z_]\w*)|\b[A-Za-z_]\w*[\s*&]+([A-Za-z_]\w*)\s*\(', text)
-                new_names = {name for declaration in declarations for name in declaration if name}
-                if not new_names <= names:
-                    names.update(new_names)
-                    changed = True
-                for include, module in links:
-                    target = include or module.replace('.', '/') + '.py'
-                    for possible in (str(Path(path).parent / target), target):
-                        if possible in available:
-                            related.append(possible)
-            if tokens & names or Path(path).name in {'CMakeLists.txt', 'Makefile', 'pyproject.toml'}:
-                related.append(path)
-            for target in related:
-                edge = (path, target)
-                if edge in edges:
-                    continue
-                if len(edges) >= profile.discovery_edges:
-                    omitted.extend(t for t in related if t not in included)
-                    limit = 'edges'
+            edge = (path, target)
+            if edge in edges:
+                continue
+            if len(edges) >= profile.discovery_edges:
+                reason = 'edges'
+                break
+            if target not in included:
+                if len(included) >= profile.discovery_paths:
+                    reason = 'paths'
                     break
-                edges.add(edge)
-                if target not in included:
-                    if len(included) >= profile.discovery_paths:
-                        omitted.append(target)
-                        limit = 'paths'
+                included[target] = None
+                pending.append(target)
+                add_names({Path(target).stem})
+            edges.add(edge)
+        if reason:
+            omitted.update(target for target in related if target not in included)
+        return reason
+
+    def matches(path, tokens):
+        return bool(tokens & names) or Path(path).name in {'CMakeLists.txt', 'Makefile', 'pyproject.toml'}
+
+    while not (limit or scan_limit):
+        if pending:
+            path = pending.popleft()
+            if path not in sources:
+                limit = scan(path)
+                if limit:
+                    break
+            text, tokens = sources[path]
+            declarations = re.findall(r'\bdef\s+([A-Za-z_]\w*)|\b[A-Za-z_]\w*[\s*&]+([A-Za-z_]\w*)\s*\(', text)
+            add_names({name for declaration in declarations for name in declaration if name})
+            related = []
+            for include, module in re.findall(r'(?:#\s*include\s*["<]([^">]+)|(?:from|import)\s+([\w.]+))', text):
+                target = include or module.replace('.', '/') + '.py'
+                for possible in (str(Path(path).parent / target), target):
+                    if possible in available:
+                        related.append(possible)
+            if matches(path, tokens):
+                related.append(path)
+                unmatched.pop(path, None)
+            else:
+                unmatched[path] = tokens
+            limit = expand(path, related)
+        elif revisit:
+            # Newly discovered names can turn previously scanned files into dependents.
+            revisit = False
+            for path, tokens in list(unmatched.items()):
+                if limit := interrupted():
+                    break
+                if matches(path, tokens):
+                    del unmatched[path]
+                    if limit := expand(path, [path]):
                         break
-                    included.append(target)
-                    names.add(Path(target).stem)
-                    changed = True
-    if not limit and len(available) > profile.discovery_paths:
-        limit = 'paths'
-    return Coverage(intended_paths=included, omitted_paths=sorted(set(omitted)),
-                    limit_reached=limit, unenumerated_remainder=bool(limit))
+        else:
+            path = next(background, None)
+            if path is None:
+                break
+            if path in sources:
+                continue
+            reason = scan(path)
+            if reason == 'cancelled':
+                limit = reason
+            elif reason:
+                scan_limit = reason
+            elif matches(path, sources[path][1]):
+                limit = expand(path, [path])
+            else:
+                unmatched[path] = sources[path][1]
+
+    return Coverage(intended_paths=list(included), omitted_paths=sorted(omitted),
+                    unscanned_paths=sorted(available.keys() - sources.keys()), limit_reached=limit,
+                    scan_limit_reached=scan_limit, unenumerated_remainder=bool(limit or scan_limit))
 
 
 def evidence_progress(previous, observation, scope):

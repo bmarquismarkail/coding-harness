@@ -52,7 +52,9 @@ class Coverage(Contract):
     intended_paths: list[str] = Field(default_factory=list)
     examined_paths: list[str] = Field(default_factory=list)
     omitted_paths: list[str] = Field(default_factory=list)
+    unscanned_paths: list[str] = Field(default_factory=list)
     limit_reached: str | None = None
+    scan_limit_reached: str | None = None
     unenumerated_remainder: bool = False
 
 

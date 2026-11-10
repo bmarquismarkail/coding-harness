@@ -113,6 +113,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.evidence.patch_source_hash,
                          next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
 
+    def test_unscanned_inventory_does_not_block_verified_repair(self):
+        unrelated = [f"filler_{number:03}.cpp" for number in range(500)]
+        for path in unrelated:
+            (self.source / path).write_text("int filler = 0;\n")
+        run_id = self.harness.submit(request(self.source))
+        Engine(self.harness.store, run_id, RepairProvider()).execute()
+        result = self.harness.result(run_id)
+        self.assertIsNotNone(result, self.harness.status(run_id).error)
+        self.assertEqual(result.outcome, "verified", result.gaps)
+        self.assertNotIn("scope_limit", result.review.partial_reasons)
+        coverage = result.review.coverage
+        self.assertEqual(coverage.intended_paths, ["latency.py"])
+        self.assertEqual(coverage.omitted_paths, [])
+        self.assertEqual(coverage.unscanned_paths, [
+            *unrelated[199:], "tests/test_acceptance.py", "tests/test_existing.py"])
+        self.assertIsNone(coverage.limit_reached)
+        self.assertEqual(coverage.scan_limit_reached, "paths")
+        self.assertTrue(coverage.unenumerated_remainder)
+
     def test_investigative_draft_does_not_block_verified_repair(self):
         """Keep a working draft available without treating it as a final finding."""
         draft = {"id": "iterator", "title": "Iterator bug", "claim": "Generators have no len()",

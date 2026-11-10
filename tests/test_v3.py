@@ -148,7 +148,15 @@ class EvidenceTests(unittest.TestCase):
     def test_legacy_results_and_review_roundtrip(self):
         old = RunResult(run_id=self.rid, outcome='unverified', summary='old', findings=[{'note': 'legacy'}])
         self.assertIsNone(old.review)
-        old.review = ReviewDetails(completion='partial', partial_reasons=['budget_exhausted'])
+        legacy = RunResult.model_validate({**old.model_dump(), 'review': {
+            'completion': 'partial', 'partial_reasons': ['scope_limit'],
+            'coverage': {'limit_reached': 'paths', 'unenumerated_remainder': True}}})
+        self.assertEqual(legacy.review.coverage.limit_reached, 'paths')
+        self.assertIsNone(legacy.review.coverage.scan_limit_reached)
+        self.assertEqual(legacy.review.coverage.unscanned_paths, [])
+        old.review = ReviewDetails(completion='completed', coverage=Coverage(
+            intended_paths=['a.py'], examined_paths=['a.py'], unscanned_paths=['b.py'],
+            scan_limit_reached='paths', unenumerated_remainder=True))
         self.assertEqual(RunResult.model_validate_json(old.model_dump_json()), old)
 
     def test_source_move_makes_probe_target_inconclusive(self):
@@ -342,26 +350,152 @@ class InvestigationTests(unittest.TestCase):
             scope = discover_scope(workspace, Profile(name='test'), [*invalid, *valid])
             self.assertEqual(scope.intended_paths, ['deleted.py', 'new/module.py', '.env.example'])
 
-    def test_scope_limits_keep_patch_and_focus_seeds(self):
-        """Seed discovery with exact patch and focus paths before applying scan budgets."""
+    def test_inventory_path_limit_keeps_small_patch_and_focused_review_complete(self):
+        """Report optional inventory omissions separately from an unfinished review."""
         from coding_agent.workspace import Workspace
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); source = root/'source'; source.mkdir()
-            for i in range(201):
-                (source/f'f{i:03d}.py').write_text('value = 1\n')
+            unrelated = [f'f{i:03d}.cpp' for i in range(500)]
+            for path in unrelated:
+                (source/path).write_text('int filler = 1;\n')
+            target = 'z_changed.cpp'
+            (source/target).write_text('int value = 1;\n')
             (root/'run').mkdir()
             workspace = Workspace(root/'run'); workspace.prepare(source)
-            (workspace.root/'f200.py').write_text('value = 2\n')
-            cases = [
-                (Profile(name='paths'), (), True, ['f200.py'], 'paths'),
-                (Profile(name='paths'), ['f200.py'], False, ['f200.py'], 'paths'),
-                (Profile(name='bytes', discovery_bytes=1), ['f199.py'], True, ['f200.py', 'f199.py'], 'bytes'),
-            ]
-            for profile, focus, implementation, expected, limit in cases:
-                with self.subTest(limit=limit, focus=focus, implementation=implementation):
-                    scope = discover_scope(workspace, profile, focus, implementation=implementation)
-                    self.assertEqual(scope.intended_paths, expected)
-                    self.assertEqual(scope.limit_reached, limit)
+            (workspace.root/target).write_text('int value = 2;\n')
+            scope = discover_scope(workspace, Profile(name='test'), implementation=True)
+            self.assertEqual(scope.intended_paths, [target])
+            self.assertEqual(scope.omitted_paths, [])
+            self.assertEqual(scope.unscanned_paths, unrelated[199:])
+            self.assertIsNone(scope.limit_reached)
+            self.assertEqual(scope.scan_limit_reached, 'paths')
+            self.assertTrue(scope.unenumerated_remainder)
+
+            harness = Harness(root/'state', autostart=False, profiles={'one': {'discovery_paths': 1}})
+            for focus, read, profile in (([target], target, None), ([], unrelated[0], 'one')):
+                with self.subTest(focus=focus):
+                    rid = harness.submit(TaskRequest(root=str(source), task='Review source', mode='review',
+                                                     focus_paths=focus, profile=profile))
+                    actions = iter([
+                        {'type': 'tool', 'tool': 'read_file', 'args': {'path': read}},
+                        {'type': 'finish', 'summary': 'Finished review'},
+                    ])
+
+                    class Provider:
+                        def invoke(self, messages, *, role):
+                            return '{}' if role == 'reviewer' else json.dumps(next(actions))
+
+                    Engine(harness.store, rid, Provider()).execute()
+                    review = harness.result(rid).review
+                    self.assertEqual(review.coverage.examined_paths, [read])
+                    if focus:
+                        self.assertEqual(review.completion, 'completed')
+                        self.assertEqual(review.partial_reasons, [])
+                        self.assertEqual(review.coverage, scope.model_copy(update={'examined_paths': [read]}))
+                    else:
+                        self.assertEqual(review.completion, 'partial')
+                        self.assertEqual(review.partial_reasons, ['scope_limit'])
+                        self.assertEqual(review.coverage.omitted_paths, [*unrelated[1:], target])
+                        self.assertEqual(review.coverage.unscanned_paths, [*unrelated, target])
+
+    def test_dependencies_take_priority_over_optional_inventory(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            (source/'a.py').write_text('import z\n')
+            (source/'b.py').write_text('# oversized\n' * 20)
+            (source/'z.py').write_text('value = 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            for profile, reason in ((Profile(name='test', discovery_paths=2), 'paths'),
+                                    (Profile(name='test', discovery_bytes=30), 'bytes')):
+                with self.subTest(reason=reason):
+                    scope = discover_scope(workspace, profile, ['a.py'])
+                    self.assertEqual(scope.intended_paths, ['a.py', 'z.py'])
+                    self.assertEqual(scope.unscanned_paths, ['b.py'])
+                    self.assertEqual(scope.omitted_paths, [])
+                    self.assertIsNone(scope.limit_reached)
+                    self.assertEqual(scope.scan_limit_reached, reason)
+                    self.assertTrue(scope.unenumerated_remainder)
+
+    def test_required_scan_interruption_preserves_unread_inventory(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            (source/'a.py').write_text('import b\n' + '# ' + 'x' * 65536)
+            (source/'b.py').write_text('value = 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            ticks = iter([0, 0, 0, 3])  # Expire before reading the second chunk of a.py.
+            scope = discover_scope(workspace, Profile(name='test'), ['a.py'], clock=lambda: next(ticks))
+            self.assertEqual(scope.intended_paths, ['a.py'])
+            self.assertEqual(scope.unscanned_paths, ['a.py', 'b.py'])
+            self.assertEqual(scope.omitted_paths, [])
+            self.assertEqual(scope.limit_reached, 'seconds')
+            self.assertIsNone(scope.scan_limit_reached)
+            self.assertTrue(scope.unenumerated_remainder)
+
+    def test_optional_scan_timeout_leaves_known_scope_complete(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            for path in ('a.py', 'b.py', 'c.py'):
+                (source/path).write_text('value = 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            elapsed = 0
+            open_source = Path.open
+
+            def expire_during_optional_read(path, *args, **kwargs):
+                nonlocal elapsed
+                if path == workspace.root/'b.py':
+                    elapsed = 3
+                return open_source(path, *args, **kwargs)
+
+            with patch.object(Path, 'open', expire_during_optional_read):
+                scope = discover_scope(workspace, Profile(name='test'), ['a.py'], clock=lambda: elapsed)
+            self.assertEqual(scope.intended_paths, ['a.py'])
+            self.assertEqual(scope.unscanned_paths, ['b.py', 'c.py'])
+            self.assertEqual(scope.omitted_paths, [])
+            self.assertIsNone(scope.limit_reached)
+            self.assertEqual(scope.scan_limit_reached, 'seconds')
+            self.assertTrue(scope.unenumerated_remainder)
+
+    def test_revisits_cached_dependents_after_discovering_new_names(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            (source/'entry.py').write_text('value = 1\n')
+            (source/'a_caller.py').write_text('value = exported()\n')
+            (source/'b_bridge.py').write_text('import entry\nimport z\n')
+            (source/'z.py').write_text('def exported(): return 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            scope = discover_scope(workspace, Profile(name='test', discovery_paths=4), ['entry.py'])
+            self.assertEqual(scope.intended_paths, ['entry.py', 'b_bridge.py', 'z.py', 'a_caller.py'])
+            self.assertEqual(scope.unscanned_paths, [])
+            self.assertIsNone(scope.limit_reached)
+            self.assertIsNone(scope.scan_limit_reached)
+            self.assertFalse(scope.unenumerated_remainder)
+
+    def test_scope_caps_retain_every_known_omitted_target(self):
+        from coding_agent.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root/'source'; source.mkdir()
+            (source/'a.py').write_text('import b\nimport c\nimport d\n')
+            for path in ('b.py', 'c.py', 'd.py'):
+                (source/path).write_text('value = 1\n')
+            (root/'run').mkdir()
+            workspace = Workspace(root/'run'); workspace.prepare(source)
+            for profile, reason in ((Profile(name='test', discovery_paths=2), 'paths'),
+                                    (Profile(name='test', discovery_edges=1), 'edges')):
+                with self.subTest(reason=reason):
+                    scope = discover_scope(workspace, profile, ['a.py'])
+                    self.assertEqual(scope.intended_paths, ['a.py', 'b.py'])
+                    self.assertEqual(scope.omitted_paths, ['c.py', 'd.py'])
+                    self.assertEqual(scope.unscanned_paths, ['b.py', 'c.py', 'd.py'])
+                    self.assertEqual(scope.limit_reached, reason)
+                    self.assertIsNone(scope.scan_limit_reached)
                     self.assertTrue(scope.unenumerated_remainder)
 
     def test_review_completion_requires_evidence_for_each_intended_path(self):
