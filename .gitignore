@@ -7,6 +7,11 @@ venv/
 *.egg-info/
 build/
 dist/
+pilots/
+
+# Indexing
+graphify-out/ 
+.zvec-grep/
 
 # Machine-specific configuration and raw run evidence
 /agent-config.local.json
