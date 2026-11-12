@@ -139,10 +139,12 @@ class RuntimeTests(unittest.TestCase):
                     return json.dumps({"type": "tool", "tool": "apply_patch", "args": self.edit})
                 if step == 4:
                     test.assertIn("Use args.changes", messages[-1]["content"])
+                    test.assertEqual(json.loads(messages[-1]["content"])["error_code"], "invalid_arguments")
                     test.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
                     return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [self.edit]}})
                 if step == 5:
                     test.assertIn("Reread the target", messages[-1]["content"])
+                    test.assertEqual(json.loads(messages[-1]["content"])["error_code"], "stale_hash")
                     test.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
                     return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": "latency.py"}})
                 if step == 6:
@@ -163,6 +165,108 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.outcome, "verified", result.gaps)
         self.assertTrue(result.patch)
         self.assertGreater(provider.worker_calls, 0)
+
+    def test_recovery_constrains_creation_of_unread_required_file(self):
+        self.assert_required_creation_recovery({"type": "finish", "summary": "Premature finish"})
+
+    def test_blocked_candidate_check_immediately_constrains_creation(self):
+        self.assert_required_creation_recovery({
+            "type": "tool", "tool": "run_check", "args": {"check_id": "acceptance", "phase": "candidate"},
+        })
+
+    def test_wrong_path_edit_immediately_constrains_creation(self):
+        self.assert_required_creation_recovery({
+            "type": "tool", "tool": "apply_patch", "args": {"changes": [
+                {"path": "other.py", "expected_hash": None, "content": "pass"},
+            ]},
+        })
+
+    def assert_required_creation_recovery(self, first_action):
+        source = self.root / "empty-source"
+        source.mkdir()
+        (source / "README.md").write_text("Fixture")
+        target = "required.py"
+        request = TaskRequest(root=str(source), task="Create the required source.",
+                              required_patch_paths=[target], checks=[
+            CheckSpec(id="acceptance", argv=[sys.executable, "-c",
+                     "from pathlib import Path; assert Path('required.py').is_file()"]),
+            CheckSpec(id="regression", kind="regression", argv=[sys.executable, "-c", "pass"]),
+        ])
+        run_id = self.harness.submit(request)
+        engine = Engine(self.harness.store, run_id)
+        calls = 0
+
+        def invoke(messages, *, role, schema=None):
+            nonlocal calls
+            if role == "reviewer":
+                return EMPTY_REVIEW_JSON
+            if role == "subagent":
+                return '{"type":"finish","summary":"Reviewed candidate"}'
+            calls += 1
+            if calls == 1:
+                return json.dumps(first_action)
+            if 2 <= calls <= 5:
+                if calls <= 3:
+                    patch_schema, inspection_schema = schema["anyOf"]
+                    self.assertEqual(inspection_schema["properties"]["tool"]["enum"], ["read_file", "inspect_diff"])
+                else:
+                    patch_schema = schema
+                props = patch_schema["properties"]
+                self.assertEqual(props["tool"]["const"], "apply_patch")
+                change = props["args"]["properties"]["changes"]["items"]["anyOf"][0]["properties"]
+                self.assertEqual(change["path"]["const"], target)
+                self.assertIsNone(change["expected_hash"]["const"])
+                self.assertEqual(change["content"]["type"], "string")
+                if calls == 2:
+                    self.assertIn(target, messages[-1]["content"])
+                    return '{"type":"tool","tool":"read_file","args":{"path":"README.md"}}'
+                if calls == 3:
+                    self.assertEqual(json.loads(messages[-1]["content"])["remaining_inspections"], 1)
+                    return '{"type":"tool","tool":"inspect_diff","args":{}}'
+                if calls == 4:
+                    self.assertEqual(json.loads(messages[-1]["content"])["remaining_inspections"], 0)
+                    return '{"type":"tool","tool":"inspect_diff","args":{}}'
+                self.assertIn("Inspection limit reached", messages[-1]["content"])
+                return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [
+                    {"path": target, "expected_hash": None, "content": "pass\n"}
+                ]}})
+            if calls == 6:
+                return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": target}})
+            return json.dumps({"type": "finish", "summary": "Created required source",
+                               "diagnosis": "The required module was absent.", "diagnosis_sources": cited_source(messages)})
+
+        with patch.object(engine.provider, "invoke", side_effect=invoke):
+            engine.execute()
+        result = self.harness.result(run_id)
+        self.assertEqual(result.outcome, "verified", result.gaps)
+        self.assertIn("new file mode", result.patch)
+        self.assertEqual(calls, 7)
+
+    def test_required_patch_path_blocks_checks_after_wrong_file_edit(self):
+        req = request(self.source, required_patch_paths=["latency.py"])
+        run_id = self.harness.submit(req)
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+        broker = engine.broker
+
+        broker.invoke("apply_patch", {"changes": [
+            {"path": "other.py", "expected_hash": None, "content": "pass\n"},
+        ]}, key="wrong-edit")
+        self.assertEqual(engine.checks.missing_patch_paths(), ["latency.py"])
+        with self.assertRaisesRegex(ValueError, "Candidate checks require a patch containing: latency.py"):
+            broker.invoke("run_check", {"check_id": "acceptance", "phase": "candidate"}, key="blocked")
+        self.assertIsNone(self.harness.store.receipt(run_id, "blocked"))
+        baseline = broker.invoke("run_check", {"check_id": "acceptance", "phase": "baseline"}, key="baseline")["result"]
+        self.assertIn("TypeError", baseline["output"])
+
+        read = broker.invoke("read_file", {"path": "latency.py"}, key="read-required")["result"]
+        broker.invoke("apply_patch", {"changes": [
+            {"path": "latency.py", "expected_hash": read["sha256"], "content": GOOD},
+        ]}, key="required-edit")
+        self.assertEqual(engine.checks.missing_patch_paths(), [])
+        candidate = broker.invoke("run_check", {"check_id": "acceptance", "phase": "candidate"}, key="candidate")["result"]
+        self.assertTrue(candidate["passed"], candidate["output"])
 
     def test_review_command_cannot_invalidate_source_evidence(self):
         run_id = self.harness.submit(request(self.source, mode="review"))

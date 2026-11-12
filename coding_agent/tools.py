@@ -53,6 +53,14 @@ class PageArgs(Contract):
     limit: int = Field(default=10, ge=1, le=20)
 
 
+class EditRejected(ValueError):
+    """A broker rejection with a stable reason code for recovery feedback."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 class Change(Contract):
     path: str
     expected_hash: str | None
@@ -141,7 +149,12 @@ class ToolBroker:
         if name not in self.schemas():
             raise PermissionError(f"tool {name!r} is not available for this role")
         schema = {**READ_TOOLS, **WRITE_TOOLS}[name]
-        parsed = schema.model_validate(args)
+        try:
+            parsed = schema.model_validate(args)
+        except ValueError as exc:
+            if name == "apply_patch":
+                raise EditRejected("invalid_arguments", str(exc)) from exc
+            raise
         self.store.consume(self.run_id)
         if name in {"apply_patch", "run_command", "run_check", "register_check"} and self.pool and self.pool.pending():
             raise ValueError("collect running specialists before changing or executing the workspace")
@@ -338,13 +351,16 @@ class ToolBroker:
         for change in args.changes:
             self.require_instructions(change.path)
             if change.path in seen:
-                raise ValueError("duplicate patch path")
+                raise EditRejected("duplicate_path", "duplicate patch path")
             seen.add(change.path)
-            path = self._path(change.path)
+            try:
+                path = self._path(change.path)
+            except ValueError as exc:
+                raise EditRejected("invalid_path", str(exc)) from exc
             if any(p.is_symlink() for p in [path, *path.parents] if p.is_relative_to(self.workspace.root)):
-                raise ValueError("editing through symlinks is forbidden")
+                raise EditRejected("invalid_path", "editing through symlinks is forbidden")
             if path.is_dir():
-                raise ValueError(f"{change.path} is a directory; apply_patch requires a file path")
+                raise EditRejected("invalid_path", f"{change.path} is a directory; apply_patch requires a file path")
             current = digest(path)
             after = hashlib.sha256(change.content.encode()).hexdigest() if change.content is not None else None
             if receipt and current == after:
@@ -352,7 +368,7 @@ class ToolBroker:
                 changes.append((change, path, after, complete))
                 continue
             if current != change.expected_hash:
-                raise ValueError(f"source changed for {change.path}; read it again before editing")
+                raise EditRejected("stale_hash", f"source changed for {change.path}; read it again before editing")
             changes.append((change, path, after, False))
         desired = {c.path: {"before": c.expected_hash, "after": after} for c, p, after, done in changes}
         self.store.save_receipt(self.run_id, key, "edit", "started", {"files": desired, "action_hash": action_hash})

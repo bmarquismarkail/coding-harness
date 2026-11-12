@@ -60,7 +60,7 @@ class Harness:
         """Authorize a request and queue it with frozen configuration and probes."""
         request = TaskRequest.model_validate(request)
         source = self._authorize(request.root)
-        for focus in request.focus_paths:
+        for focus in [*request.focus_paths, *request.required_patch_paths]:
             checked_path(source, focus)
         request, skills = resolve_request(request, source, self.project_profiles)
         for dependency in request.readonly_dependencies:

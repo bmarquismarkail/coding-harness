@@ -18,9 +18,11 @@ class Checks:
     def __init__(self, store: Store, run_id: str, workspace: Workspace, runner: SandboxRunner):
         self.store, self.run_id, self.workspace, self.runner = store, run_id, workspace, runner
         self.path = workspace.folder / "checks.json"
+        self.required_patch_paths: list[str] = []
 
     def initialize(self, request: TaskRequest):
         self._request_specs = list(request.checks or [])
+        self.required_patch_paths = request.required_patch_paths
         if self.path.exists():
             return
         checks = [{"spec": c.model_dump(), "origin": "request", "oracle": {}} for c in (request.checks or [])]
@@ -76,12 +78,22 @@ class Checks:
         self._save(checks)
         return {"registered": spec.id, "oracle": oracle}
 
+    def missing_patch_paths(self) -> list[str]:
+        if not self.required_patch_paths:
+            return []
+        changed = set(self.workspace.changed_paths())
+        return [path for path in self.required_patch_paths
+                if Path(path).as_posix() not in changed or not checked_path(self.workspace.root, path).is_file()]
+
     def execute(self, check_id: str, phase: str, *, key: str) -> dict:
         if phase not in {"baseline", "candidate"}:
             raise ValueError("phase must be baseline or candidate")
         definition = next((c for c in self.definitions() if c["spec"]["id"] == check_id), None)
         if definition is None:
             raise ValueError("unknown check ID")
+        missing = self.missing_patch_paths() if phase == "candidate" else []
+        if missing:
+            raise ValueError("Candidate checks require a patch containing: " + ", ".join(missing))
         spec = CheckSpec.model_validate(definition["spec"])
         root = self.workspace.baseline_check_root() if phase == "baseline" else self.workspace.root
         expected_baseline = manifest(self.workspace.baseline)
@@ -181,6 +193,8 @@ class Checks:
         fingerprint = tree_hash(self.workspace.root)
         records = [r["data"] for r in self.store.receipts(self.run_id, "check") if r["state"] == "completed"]
         gaps = list(gaps)
+        for path in self.missing_patch_paths():
+            gaps.append(f"Required patch path is missing or unchanged: {path}")
         definitions = self.definitions()
         candidates = sorted([r for r in records if r.get("phase") == "candidate" and r.get("source_hash") == fingerprint],
                             key=lambda r:r.get("executed_at", 0))

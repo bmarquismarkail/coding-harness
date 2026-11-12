@@ -56,9 +56,12 @@ class TaskRequest(Contract):
     readonly_dependencies: list[str] = Field(default_factory=list, max_length=20)
     defect_probes: list[DefectProbeSpec] = Field(default_factory=list, max_length=50)
     focus_paths: list[str] = Field(default_factory=list, max_length=40)
+    required_patch_paths: list[str] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def check_graph(self):
+        if self.required_patch_paths and self.mode != "implement":
+            raise ValueError("required patch paths apply only to implementation jobs")
         known: set[str] = set()
         for check in self.checks or []:
             if check.id in known or not set(check.requires) <= known:

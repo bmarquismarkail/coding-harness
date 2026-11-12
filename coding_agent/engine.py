@@ -23,7 +23,7 @@ from .project_profiles import skill_context, skill_metadata
 from .runtime_model import RecordingProvider, RecoverableResponseError
 from .sandbox import SandboxError, SandboxRunner
 from .store import Store
-from .tools import EvidenceArgs, ListArgs, ReadArgs, ToolBroker, WorkerTask
+from .tools import EditRejected, EvidenceArgs, ListArgs, ReadArgs, ToolBroker, WorkerTask
 from .types import FinishAction, InputAction, Profile, TaskRequest, ToolAction, action_schema, parse_action
 from .workspace import Workspace, checked_path, digest, paths, tree_hash
 from .zvec import ZvecGrepSettings, ZvecGrepTool
@@ -51,7 +51,12 @@ class LoopState(TypedDict, total=False):
     diagnosis_aliases: dict[str, str]
     repair_finish_refs: list[str]
     edit_aliases: dict[str, dict[str, str]]
-    repair_edit_refs: dict[str, str]
+    repair_edit_refs: dict[str, str | None]
+    repair_inspections: int
+
+
+EDIT_INSPECTION_TOOLS = ("read_file", "inspect_diff")
+EDIT_INSPECTION_LIMIT = 2
 
 
 def bounded_messages(messages: list[dict], budget: int) -> list[dict]:
@@ -420,6 +425,14 @@ class Engine:
                 break
         return "\n".join(chunks)
 
+    def missing_creation_references(self, missing_paths) -> dict[str, None]:
+        refs = {}
+        for path in missing_paths:
+            target = checked_path(self.workspace.root, path)
+            if not target.exists() and not target.is_symlink():
+                refs[path] = None
+        return refs
+
     def current_edit_references(self, aliases, targets=None):
         refs = {}
         for path, known in list(aliases.items())[:20]:
@@ -473,7 +486,9 @@ class Engine:
                         {"type": "object", "additionalProperties": False,
                          "required": ["path", "expected_hash", "content"],
                          "properties": {"path": {"const": path}, "expected_hash": {"const": ref},
-                                        "content": {"anyOf": [{"type": "string", "maxLength": 200000}, {"type": "null"}]},
+                                        "content": ({"type": "string", "minLength": 1, "maxLength": 200000}
+                                                    if ref is None else
+                                                    {"anyOf": [{"type": "string", "maxLength": 200000}, {"type": "null"}]}),
                                         "executable": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}}}
                         for path, ref in edit_refs.items()
                     ]
@@ -486,6 +501,14 @@ class Engine:
                                                                 "maxItems": len(changes), "items": {"anyOf": changes}}
                                                 }}},
                     }
+                    if state.get("repair_inspections", 0) < EDIT_INSPECTION_LIMIT:
+                        schema = {"anyOf": [schema, {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["type", "tool", "args"],
+                            "properties": {"type": {"const": "tool"},
+                                           "tool": {"enum": list(EDIT_INSPECTION_TOOLS)},
+                                           "args": {"type": "object"}},
+                        }]}
                     raw = self.provider.invoke(bounded, role="main", schema=schema)
                 else:
                     raw = self.provider.invoke(bounded, role="main")
@@ -501,6 +524,27 @@ class Engine:
                     if self.request.mode == "implement" and isinstance(parsed, FinishAction):
                         aliases = state.get("diagnosis_aliases", {})
                         parsed.diagnosis_sources = [aliases.get(citation, citation) for citation in parsed.diagnosis_sources]
+                    refs = state.get("repair_edit_refs", {})
+                    if refs:
+                        inspection = isinstance(parsed, ToolAction) and parsed.tool in EDIT_INSPECTION_TOOLS
+                        if inspection:
+                            if state.get("repair_inspections", 0) >= EDIT_INSPECTION_LIMIT:
+                                raise ValueError("Inspection limit reached. Use apply_patch with a supplied edit reference.")
+                        else:
+                            if not isinstance(parsed, ToolAction) or parsed.tool != "apply_patch":
+                                raise ValueError("Use apply_patch or a permitted inspection tool before continuing.")
+                            changes = parsed.args.get("changes")
+                            if not isinstance(changes, list) or not changes or any(
+                                not isinstance(change, dict) or not isinstance(change.get("path"), str)
+                                or change["path"] not in refs
+                                or "expected_hash" not in change or change["expected_hash"] != refs[change["path"]]
+                                or (refs[change["path"]] is None and (
+                                    not isinstance(change.get("content"), str) or not change["content"].strip()
+                                ))
+                                for change in changes
+                            ):
+                                raise ValueError("Use apply_patch with a listed path and its exact expected_hash. "
+                                                 "For creation, supply nonempty complete file content.")
                     action = parsed.model_dump()
                     if isinstance(parsed, ToolAction) and parsed.tool == "apply_patch":
                         aliases = state.get("edit_aliases", {})
@@ -544,10 +588,13 @@ class Engine:
                     observation = self.broker.invoke(action.tool, action.args, key=key)
                 except (ValueError, PermissionError, FileNotFoundError) as exc:
                     observation = {"error": str(exc)}
+                    if isinstance(exc, EditRejected):
+                        observation["error_code"] = exc.code
+                        self.store.event(self.run_id, "edit_rejected", {"code": exc.code})
                     if self.request.mode == "implement" and action.tool == "apply_patch":
                         observation["repair_hint"] = (
                             "Reread the target with read_file and copy edit_reference.expected_hash exactly. Null is only for a new file."
-                            if str(exc).startswith("source changed for ") else
+                            if observation.get("error_code") == "stale_hash" else
                             "Use args.changes, an array of edits. Example: " + PATCH_ACTION_EXAMPLE
                         )
                     elif action.tool == "run_check":
@@ -562,11 +609,16 @@ class Engine:
                         )
             aliases = dict(state.get("diagnosis_aliases", {}))
             finish_refs = []
-            edit_refs = {}
+            inspecting = (
+                state.get("repair_edit_refs") and isinstance(action, ToolAction)
+                and action.tool in EDIT_INSPECTION_TOOLS
+            )
+            edit_refs = dict(state["repair_edit_refs"]) if inspecting else {}
+            inspections = state.get("repair_inspections", 0) + 1 if inspecting else 0
             recovered_investigation = False
             edit_aliases = dict(state.get("edit_aliases", {}))
             if (self.profile.check_after_edit and isinstance(action, ToolAction) and action.tool == "apply_patch"
-                    and str(observation.get("error", "")).startswith("source changed for ")):
+                    and observation.get("error_code") == "stale_hash"):
                 changes = action.args.get("changes", [])
                 targets = {change["path"] for change in changes if isinstance(change, dict)
                            and isinstance(change.get("path"), str)} if isinstance(changes, list) else set()
@@ -574,6 +626,14 @@ class Engine:
                 if edit_refs:
                     observation["edit_references"] = edit_refs
                     observation["repair_hint"] = "Retry apply_patch with the exact current edit reference. Reread the target if more source context is needed."
+            blocked_candidate_check = (
+                isinstance(action, ToolAction) and action.tool == "run_check"
+                and str(observation.get("error", "")).startswith("Candidate checks require a patch containing: ")
+            )
+            if blocked_candidate_check:
+                edit_refs = self.missing_creation_references(self.checks.missing_patch_paths())
+                if edit_refs:
+                    observation.pop("review_hint", None)
             ledger, progressed = evidence_progress(state.get("progress_ledger", {}), observation, self.coverage.intended_paths)
             if isinstance(action, ToolAction) and action.tool == "apply_patch" and "error" not in observation:
                 for change in action.args.get('changes', []):
@@ -581,7 +641,12 @@ class Engine:
                         if change['path'] not in self.coverage.intended_paths:
                             self.coverage.intended_paths.append(change['path'])
                 patch_id = self.store.artifact(self.run_id, self.workspace.patch())
-                progressed = patch_id != ledger.get("patch")
+                missing_patch_paths = self.checks.missing_patch_paths()
+                progressed = not missing_patch_paths and patch_id != ledger.get("patch")
+                if missing_patch_paths:
+                    observation["required_patch_paths_missing"] = missing_patch_paths
+                    observation["next_action"] = "Edit the required paths before running candidate checks."
+                    edit_refs = self.missing_creation_references(missing_patch_paths)
                 ledger["patch"] = patch_id
                 if progressed and self.request.mode == "implement" and self.profile.check_after_edit:
                     checks = self.checks.run_all("candidate", f"post-edit:{self.revision}:{patch_id}")
@@ -614,8 +679,15 @@ class Engine:
                         hint = runtime_repair_hint(checks)
                         if hint:
                             observation["runtime_hint"] = hint
+            creation_handoff = any(ref is None for ref in edit_refs.values())
+            if creation_handoff and not inspecting:
+                observation["edit_references"] = edit_refs
+                observation["next_action"] = (
+                    "Create a listed required file now using apply_patch with expected_hash: null and complete source text."
+                )
             streak = 0 if progressed else state.get("reads_since_edit", 0) + 1
-            failures = state.get("protocol_failures", 0) + 1 if "error" in observation else 0
+            failures = (state.get("protocol_failures", 0) + 1
+                        if "error" in observation and not (blocked_candidate_check and creation_handoff) else 0)
             visible = observation
             result = observation.get("result")
             if self.request.mode == "implement" and isinstance(result, dict) and result.get("kind") == "source":
@@ -642,19 +714,26 @@ class Engine:
                     visible = {"result": source}
                 elif isinstance(action, ToolAction) and action.tool == "run_check":
                     visible = {"result": {k: v for k, v in result.items() if k not in {"artifact_id", "source_hash"}}}
+            if inspecting:
+                if isinstance(result, dict) and result.get("kind") == "source" and not result.get("baseline"):
+                    path = result["path"]
+                    if path in edit_refs and edit_refs[path] is not None:
+                        edit_refs[path] = visible.get("edit_reference", {}).get("expected_hash", result["sha256"])
+                visible = {**visible, "edit_references": edit_refs,
+                           "remaining_inspections": EDIT_INSPECTION_LIMIT - inspections}
             updates = {"messages": [*state["messages"], {"role": "user", "content": json.dumps(visible)}],
                        "reads_since_edit": streak, "progress_ledger": ledger, "protocol_failures": failures,
                        "diagnosis_aliases": aliases, "repair_finish_refs": finish_refs, "edit_aliases": edit_aliases,
-                       "repair_edit_refs": edit_refs}
+                       "repair_edit_refs": edit_refs, "repair_inspections": inspections}
             if recovered_investigation:
                 updates["partial_reasons"] = [reason for reason in state.get("partial_reasons", [])
                                               if reason != "investigation_incomplete"]
-            if streak >= 6 and "error" not in observation and not finish_refs:
+            if streak >= 6 and "error" not in observation and not finish_refs and not edit_refs:
                 updates["messages"].append({"role": "user", "content": "No new scoped evidence. Resolve the task or finish with explicit gaps."})
             reason = None
             if failures >= self.profile.protocol_failure_limit:
                 reason = "protocol_failure"
-            elif streak >= self.profile.review_no_progress_actions:
+            elif streak >= self.profile.review_no_progress_actions and not edit_refs:
                 reason = "investigation_incomplete"
             if reason:
                 updates.update(forced_finish=True, partial_reasons=[reason], action={"type": "finish",
@@ -670,7 +749,8 @@ class Engine:
             self.pool.collect_all()
             review_gaps = []
             final_checks = []
-            if self.request.mode == "implement":
+            missing_patch_paths = self.checks.missing_patch_paths()
+            if self.request.mode == "implement" and not missing_patch_paths:
                 final_key = f"final:{self.revision}:{state.get('final_attempts', 0)}"
                 self.checks.run_all("baseline", final_key+":baseline")
                 final_checks = self.checks.run_all("candidate", final_key+":candidate")
@@ -680,7 +760,7 @@ class Engine:
             patch = self.workspace.patch() if self.request.mode == "implement" else ""
             failed_checks = [check for check in final_checks if not check.get("passed")]
             diagnosis_error = None
-            if patch and not failed_checks:
+            if patch and not failed_checks and not missing_patch_paths:
                 if not action.diagnosis_sources:
                     diagnosis_error = "The finish action is missing diagnosis_sources."
                 for evidence_id in action.diagnosis_sources:
@@ -690,7 +770,7 @@ class Engine:
                         diagnosis_error = "The finish action cites invalid diagnosis_sources."
                         break
             finding_error = None
-            if patch and not failed_checks and not diagnosis_error:
+            if patch and not failed_checks and not diagnosis_error and not missing_patch_paths:
                 proposals = [*action.findings, *(action.review.findings if action.review else [])]
                 for item in proposals:
                     try:
@@ -704,9 +784,12 @@ class Engine:
                         finding_error = f"Correct your final findings: {str(exc)[:500]}"
                         break
             if (self.request.mode == "implement" and "protocol_failure" not in state.get("partial_reasons", [])
-                    and (not patch or failed_checks or diagnosis_error or finding_error)
+                    and (not patch or missing_patch_paths or failed_checks or diagnosis_error or finding_error)
                     and attempts < 3 and self.store.status(self.run_id).actions < self.profile.max_actions-10):
-                reason = ("No edit landed. Read the target with read_file and apply the repair before finishing. "
+                reason = ("The patch must include: " + ", ".join(missing_patch_paths)
+                          + ". Create or edit the required files before finishing."
+                          if missing_patch_paths else
+                          "No edit landed. Read the target with read_file and apply the repair before finishing. "
                           + PATCH_ACTION_EXAMPLE if not patch else
                           "Required checks still fail. Trace the failing input through the current code and change the source "
                           "to address the failure. Keep the original tests. Rerun the registered candidate check."
@@ -759,24 +842,30 @@ class Engine:
                             if row["data"]["task"]["id"] == advice.id and row["state"] == "failed":
                                 self.pool.save(row["key"], "failed", {**row["data"], "active": False})
                         feedback["specialist_advice_unavailable"] = str(exc)[:400]
-                edit_refs = {}
-                if self.profile.check_after_edit and (not patch or failed_checks):
+                edit_refs = self.missing_creation_references(missing_patch_paths)
+                if edit_refs:
+                    feedback["edit_references"] = edit_refs
+                    feedback["finish_rejected"] += (
+                        " Create a listed missing file with apply_patch using expected_hash: null "
+                        "and its complete source text in content. Read source or inspect the diff first if needed."
+                    )
+                elif self.profile.check_after_edit and (not patch or failed_checks):
                     targets = set(self.workspace.changed_paths()) if patch else None
                     edit_refs = self.current_edit_references(state.get("edit_aliases", {}), targets)
                     if edit_refs:
                         feedback["edit_references"] = edit_refs
                         feedback["finish_rejected"] += (
-                            " Your next action is apply_patch. Select the affected source path and copy its edit reference "
+                            " Use apply_patch after any needed inspection. Select the affected source path and copy its edit reference "
                             "into expected_hash. Preserve the original tests."
                         )
                 self.store.event(self.run_id, "repair_feedback", {"artifact_id": self.store.artifact(self.run_id, feedback)})
-                return {"forced_finish": False, "final_attempts": attempts, "diagnosis_aliases": aliases, "repair_finish_refs": finish_refs, "repair_edit_refs": edit_refs, "messages": [*state["messages"], {"role":"user", "content":json.dumps(feedback)}]}
+                return {"forced_finish": False, "final_attempts": attempts, "diagnosis_aliases": aliases, "repair_finish_refs": finish_refs, "repair_edit_refs": edit_refs, "repair_inspections": 0, "messages": [*state["messages"], {"role":"user", "content":json.dumps(feedback)}]}
             self.coverage = discover_scope(self.workspace, self.profile, self.request.focus_paths,
                                            implementation=self.request.mode == "implement", cancelled=self.cancelled)
             self.bundle, self.bundle_id = freeze_bundle(self, self.coverage)
             self.review_findings = []
             self.adjudication_ids = []
-            if self.request.mode == "implement" and self.profile.max_specialists:
+            if self.request.mode == "implement" and self.profile.max_specialists and not missing_patch_paths:
                 targets = self.coverage.intended_paths
                 for offset in range(0, len(targets), 20):
                     view = reviewer_view(self.store, self.bundle, self.bundle_id, budget=2400)
