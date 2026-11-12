@@ -8,6 +8,7 @@ import hashlib
 import time
 from pathlib import Path
 
+from .replacement import verifier_runner
 from .sandbox import SandboxRunner, CommandCancelled
 from .store import Store
 from .types import CheckSpec, EvidencePackage, RunResult, TaskRequest
@@ -18,9 +19,13 @@ class Checks:
     def __init__(self, store: Store, run_id: str, workspace: Workspace, runner: SandboxRunner):
         self.store, self.run_id, self.workspace, self.runner = store, run_id, workspace, runner
         self.path = workspace.folder / "checks.json"
+        self.required_patch_paths: list[str] = []
+        self.replacement = None
 
     def initialize(self, request: TaskRequest):
         self._request_specs = list(request.checks or [])
+        self.required_patch_paths = request.required_patch_paths
+        self.replacement = request.replacement
         if self.path.exists():
             return
         checks = [{"spec": c.model_dump(), "origin": "request", "oracle": {}} for c in (request.checks or [])]
@@ -76,12 +81,30 @@ class Checks:
         self._save(checks)
         return {"registered": spec.id, "oracle": oracle}
 
+    def missing_patch_paths(self) -> list[str]:
+        if not self.required_patch_paths:
+            return []
+        changed = set(self.workspace.changed_paths())
+        missing = [path for path in self.required_patch_paths
+                   if Path(path).as_posix() not in changed or not checked_path(self.workspace.root, path).is_file()]
+        if self.replacement:
+            spec = self.replacement
+            receipt = self.store.receipt(self.run_id, f"replacement:{spec.target_id}")
+            selector = checked_path(self.workspace.root, spec.selector_path)
+            if (not receipt or receipt["state"] != "completed" or digest(selector) != spec.selected_selector_sha256):
+                if spec.selector_path not in missing:
+                    missing.append(spec.selector_path)
+        return missing
+
     def execute(self, check_id: str, phase: str, *, key: str) -> dict:
         if phase not in {"baseline", "candidate"}:
             raise ValueError("phase must be baseline or candidate")
         definition = next((c for c in self.definitions() if c["spec"]["id"] == check_id), None)
         if definition is None:
             raise ValueError("unknown check ID")
+        missing = self.missing_patch_paths() if phase == "candidate" else []
+        if missing:
+            raise ValueError("Candidate checks require a patch containing: " + ", ".join(missing))
         spec = CheckSpec.model_validate(definition["spec"])
         root = self.workspace.baseline_check_root() if phase == "baseline" else self.workspace.root
         expected_baseline = manifest(self.workspace.baseline)
@@ -103,6 +126,12 @@ class Checks:
         if previous and previous["state"] == "completed" and previous["data"].get("source_hash") == fingerprint:
             return {**previous["data"], "output": previous["data"].get("output", "")[:6000]}
         records = [r["data"] for r in self.store.receipts(self.run_id, "check") if r["state"] == "completed"]
+        if self.replacement and phase == "candidate" and check_id == self.replacement.compile_check_id:
+            cached = next((r for r in reversed(records) if r["check_id"] == check_id and r["phase"] == phase
+                           and r["source_hash"] == fingerprint
+                           and (r.get("passed") or r.get("failure_category") == "compiler_input_failure")), None)
+            if cached:
+                return {**cached, "output": cached["output"][:6000]}
         for required in spec.requires:
             if not any(r["check_id"] == required and r["phase"] == phase and r.get("passed")
                        and r["source_hash"] == fingerprint for r in records):
@@ -120,6 +149,8 @@ class Checks:
         if len(probe_definitions) > 1:
             raise ValueError("one trusted probe is permitted per check")
         runner, argv = self.runner, spec.argv
+        if self.replacement and definition["origin"] == "request":
+            runner = verifier_runner(self.store, self.run_id, runner, self.replacement)
         probe_id = None
         if probe_definitions:
             probe_id, probe = probe_definitions[0]
@@ -140,6 +171,10 @@ class Checks:
             self.store.event(self.run_id, "check_interrupted", {"artifact_id": data["artifact_id"]})
             raise
         altered = manifest(root) != before
+        if definition["origin"] == "request" and not (result["timed_out"] or altered or result["output_truncated"]):
+            category = spec.failure_categories.get(result["exit_code"])
+            if category and result["exit_code"] != 0:
+                result["failure_category"] = category
         result.update(check_id=check_id, phase=phase, source_hash=fingerprint, origin=definition["origin"],
                       passed=(result["exit_code"] in probe["not_observed_exit_codes"] if probe_id else result["exit_code"] == 0) and not result["timed_out"] and not altered and not result["output_truncated"],
                       source_modified=altered, skipped=False, executed_at=time.time())
@@ -181,6 +216,8 @@ class Checks:
         fingerprint = tree_hash(self.workspace.root)
         records = [r["data"] for r in self.store.receipts(self.run_id, "check") if r["state"] == "completed"]
         gaps = list(gaps)
+        for path in self.missing_patch_paths():
+            gaps.append(f"Required patch path is missing or unchanged: {path}")
         definitions = self.definitions()
         candidates = sorted([r for r in records if r.get("phase") == "candidate" and r.get("source_hash") == fingerprint],
                             key=lambda r:r.get("executed_at", 0))

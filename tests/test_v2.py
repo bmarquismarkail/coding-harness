@@ -18,10 +18,11 @@ from coding_agent.config import AgentConfig, ConfigError
 from coding_agent.checks import Checks
 from coding_agent.engine import Engine
 from coding_agent.model import ModelError
+from coding_agent.replacement import select_replacement
 from coding_agent.sandbox import SandboxRunner, SandboxError
 from coding_agent.store import Store
 from coding_agent.tools import Change, PatchArgs, ReadArgs, EvidenceArgs, ToolBroker, WorkerTask
-from coding_agent.types import Profile, parse_action
+from coding_agent.types import Profile, ReplacementSpec, parse_action
 from coding_agent.workspace import Workspace, digest
 
 EMPTY_REVIEW_JSON = '{"findings":[],"observations":[],"challenges":[],"semantic_concerns":[]}'
@@ -116,6 +117,287 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result.evidence.diagnosis_sources)
         self.assertEqual(result.evidence.patch_source_hash,
                          next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
+
+    def test_repair_recovers_from_empty_finish_and_rejected_edits(self):
+        self.harness.profiles["post-edit"] = {"check_after_edit": True}
+        run_id = self.harness.submit(request(self.source, profile="post-edit"))
+        test = self
+
+        class RecoveringProvider(RepairProvider):
+            def invoke(self, messages, *, role):
+                if role != "main":
+                    return super().invoke(messages, role=role)
+                self.main_calls += 1
+                step = self.main_calls
+                if step == 1:
+                    return json.dumps({"type": "finish", "summary": "Premature repair claim"})
+                if step == 2:
+                    test.assertIn("No edit landed", messages[-1]["content"])
+                    return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": "latency.py"}})
+                if step == 3:
+                    self.citation = cited_source(messages)
+                    self.edit = {"path": "latency.py", "expected_hash": "0" * 64, "content": GOOD}
+                    return json.dumps({"type": "tool", "tool": "apply_patch", "args": self.edit})
+                if step == 4:
+                    test.assertIn("Use args.changes", messages[-1]["content"])
+                    test.assertEqual(json.loads(messages[-1]["content"])["error_code"], "invalid_arguments")
+                    test.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
+                    return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [self.edit]}})
+                if step == 5:
+                    test.assertIn("Reread the target", messages[-1]["content"])
+                    test.assertEqual(json.loads(messages[-1]["content"])["error_code"], "stale_hash")
+                    test.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
+                    return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": "latency.py"}})
+                if step == 6:
+                    self.edit["expected_hash"] = json.loads(messages[-1]["content"])["edit_reference"]["expected_hash"]
+                    return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [self.edit]}})
+                observation = json.loads(messages[-1]["content"])
+                checks = observation["candidate_checks"]
+                test.assertTrue(checks)
+                test.assertTrue(all(check["passed"] for check in checks))
+                return json.dumps({"type": "finish", "summary": "Fixed generator averaging",
+                                   "diagnosis": "Generators have no length.",
+                                   "diagnosis_sources": observation["finish_template"]["diagnosis_sources"]})
+
+        provider = RecoveringProvider()
+        engine = Engine(self.harness.store, run_id, provider)
+        engine.execute()
+        result = self.harness.result(run_id)
+        self.assertEqual(result.outcome, "verified", result.gaps)
+        self.assertTrue(result.patch)
+        self.assertGreater(provider.worker_calls, 0)
+
+    def test_recovery_constrains_creation_of_unread_required_file(self):
+        self.assert_required_creation_recovery({"type": "finish", "summary": "Premature finish"})
+
+    def test_blocked_candidate_check_immediately_constrains_creation(self):
+        self.assert_required_creation_recovery({
+            "type": "tool", "tool": "run_check", "args": {"check_id": "acceptance", "phase": "candidate"},
+        })
+
+    def test_wrong_path_edit_immediately_constrains_creation(self):
+        self.assert_required_creation_recovery({
+            "type": "tool", "tool": "apply_patch", "args": {"changes": [
+                {"path": "other.py", "expected_hash": None, "content": "pass"},
+            ]},
+        })
+
+    def assert_required_creation_recovery(self, first_action):
+        source = self.root / "empty-source"
+        source.mkdir()
+        (source / "README.md").write_text("Fixture")
+        target = "required.py"
+        request = TaskRequest(root=str(source), task="Create the required source.",
+                              required_patch_paths=[target], checks=[
+            CheckSpec(id="acceptance", argv=[sys.executable, "-c",
+                     "from pathlib import Path; assert Path('required.py').is_file()"]),
+            CheckSpec(id="regression", kind="regression", argv=[sys.executable, "-c", "pass"]),
+        ])
+        run_id = self.harness.submit(request)
+        engine = Engine(self.harness.store, run_id)
+        calls = 0
+
+        def invoke(messages, *, role, schema=None):
+            nonlocal calls
+            if role == "reviewer":
+                return EMPTY_REVIEW_JSON
+            if role == "subagent":
+                return '{"type":"finish","summary":"Reviewed candidate"}'
+            calls += 1
+            if calls == 1:
+                return json.dumps(first_action)
+            if 2 <= calls <= 5:
+                if calls <= 3:
+                    patch_schema, inspection_schema = schema["anyOf"]
+                    self.assertEqual(inspection_schema["properties"]["tool"]["enum"], ["read_file", "inspect_diff"])
+                else:
+                    patch_schema = schema
+                props = patch_schema["properties"]
+                self.assertEqual(props["tool"]["const"], "apply_patch")
+                change = props["args"]["properties"]["changes"]["items"]["anyOf"][0]["properties"]
+                self.assertEqual(change["path"]["const"], target)
+                self.assertIsNone(change["expected_hash"]["const"])
+                self.assertEqual(change["content"]["type"], "string")
+                if calls == 2:
+                    self.assertIn(target, messages[-1]["content"])
+                    return '{"type":"tool","tool":"read_file","args":{"path":"README.md"}}'
+                if calls == 3:
+                    self.assertEqual(json.loads(messages[-1]["content"])["remaining_inspections"], 1)
+                    return '{"type":"tool","tool":"inspect_diff","args":{}}'
+                if calls == 4:
+                    self.assertEqual(json.loads(messages[-1]["content"])["remaining_inspections"], 0)
+                    return '{"type":"tool","tool":"inspect_diff","args":{}}'
+                self.assertIn("Inspection limit reached", messages[-1]["content"])
+                return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [
+                    {"path": target, "expected_hash": None, "content": "pass\n"}
+                ]}})
+            if calls == 6:
+                return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": target}})
+            return json.dumps({"type": "finish", "summary": "Created required source",
+                               "diagnosis": "The required module was absent.", "diagnosis_sources": cited_source(messages)})
+
+        with patch.object(engine.provider, "invoke", side_effect=invoke):
+            engine.execute()
+        result = self.harness.result(run_id)
+        self.assertEqual(result.outcome, "verified", result.gaps)
+        self.assertIn("new file mode", result.patch)
+        self.assertEqual(calls, 7)
+
+    def replacement_engine(self):
+        verifier = self.root / "verify.py"
+        verifier.write_text("# Frozen test verifier\n")
+        selector = self.source / "selector.s"
+        selector.write_text("original\n")
+        target = "replacement.c"
+        expected = hashlib.sha256(b"selected\n").hexdigest()
+        argv = [sys.executable, str(verifier)]
+        spec = ReplacementSpec(target_id="test-target", source_path=target, selector_path=selector.name,
+                               original_selector_sha256=digest(selector), selected_selector_sha256=expected,
+                               selector_argv=[*argv, "select"], verifier_path=str(verifier),
+                               verifier_sha256=digest(verifier), compile_check_id="compile")
+        req = TaskRequest(root=str(self.source), task="Replace the target", replacement=spec,
+                          required_patch_paths=[target, selector.name], readonly_dependencies=[str(verifier)],
+                          checks=[CheckSpec(id="compile", argv=[*argv, "compile"], kind="build"),
+                                  CheckSpec(id="matching", argv=[*argv, "match"], requires=["compile"])])
+        run_id = self.harness.submit(req)
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+        (engine.workspace.root / target).write_text("PLACEHOLDER")
+        return engine
+
+    def test_automatic_selection_fails_closed(self):
+        for failure in ("stale", "source", "third_file", "verifier"):
+            with self.subTest(failure=failure):
+                engine = self.replacement_engine()
+                root = engine.workspace.root
+                if failure == "stale":
+                    (root / "selector.s").write_text("stale\n")
+                if failure == "verifier":
+                    Path(engine.request.replacement.verifier_path).write_text("# Drifted verifier\n")
+                before = digest(root / "selector.s")
+
+                def transform(_runner, stage, _argv):
+                    (stage / "selector.s").write_text("selected\n")
+                    if failure == "source":
+                        (stage / "replacement.c").write_text("tampered")
+                    if failure == "third_file":
+                        (stage / "unrelated.txt").write_text("tampered")
+                    return {"exit_code": 0, "timed_out": False, "output_truncated": False, "output": ""}
+
+                with patch.object(SandboxRunner, "run", autospec=True, side_effect=transform) as runner:
+                    result = select_replacement(engine.checks)
+                self.assertIn("error", result)
+                self.assertEqual(runner.call_count, int(failure in {"source", "third_file"}))
+                self.assertEqual(digest(root / "selector.s"), before)
+                self.assertEqual((root / "replacement.c").read_text(), "PLACEHOLDER")
+                self.assertFalse((root / "unrelated.txt").exists())
+                self.assertIn("selector.s", engine.checks.missing_patch_paths())
+
+    def test_automatic_selection_cancelled_before_publication(self):
+        engine = self.replacement_engine()
+
+        def transform(_runner, stage, _argv):
+            (stage / "selector.s").write_text("selected\n")
+            return {"exit_code": 0, "timed_out": False, "output_truncated": False, "output": ""}
+
+        engine.checks.runner.cancelled = lambda: True
+        with patch.object(SandboxRunner, "run", autospec=True, side_effect=transform):
+            with self.assertRaises(InterruptedError):
+                select_replacement(engine.checks)
+        self.assertEqual((engine.workspace.root / "selector.s").read_text(), "original\n")
+        receipt = engine.store.receipt(engine.run_id, "replacement:test-target")
+        self.assertEqual(receipt["state"], "interrupted")
+        self.assertIn("selector.s", engine.checks.missing_patch_paths())
+
+    def test_automatic_selection_resumes_after_publication(self):
+        engine = self.replacement_engine()
+        store = engine.store
+        save = store.save_receipt
+
+        def transform(_runner, stage, _argv):
+            (stage / "selector.s").write_text("selected\n")
+            return {"exit_code": 0, "timed_out": False, "output_truncated": False, "output": ""}
+
+        def interrupt(run_id, key, kind, state, data):
+            if state == "completed":
+                raise InterruptedError("after publication")
+            return save(run_id, key, kind, state, data)
+
+        with patch.object(SandboxRunner, "run", autospec=True, side_effect=transform) as runner:
+            with patch.object(store, "save_receipt", side_effect=interrupt):
+                with self.assertRaises(InterruptedError):
+                    select_replacement(engine.checks)
+            self.assertEqual(store.receipt(engine.run_id, "replacement:test-target")["state"], "prepared")
+            first = select_replacement(engine.checks)
+            (engine.workspace.root / "replacement.c").write_text("corrected")
+            self.assertEqual(select_replacement(engine.checks), first)
+            self.assertEqual(runner.call_count, 1)
+        self.assertEqual(first["c_before"], first["c_after"])
+        self.assertEqual(engine.checks.missing_patch_paths(), [])
+
+    def test_required_patch_path_blocks_checks_after_wrong_file_edit(self):
+        req = request(self.source, required_patch_paths=["latency.py"])
+        run_id = self.harness.submit(req)
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+        broker = engine.broker
+
+        broker.invoke("apply_patch", {"changes": [
+            {"path": "other.py", "expected_hash": None, "content": "pass\n"},
+        ]}, key="wrong-edit")
+        self.assertEqual(engine.checks.missing_patch_paths(), ["latency.py"])
+        with self.assertRaisesRegex(ValueError, "Candidate checks require a patch containing: latency.py"):
+            broker.invoke("run_check", {"check_id": "acceptance", "phase": "candidate"}, key="blocked")
+        self.assertIsNone(self.harness.store.receipt(run_id, "blocked"))
+        baseline = broker.invoke("run_check", {"check_id": "acceptance", "phase": "baseline"}, key="baseline")["result"]
+        self.assertIn("TypeError", baseline["output"])
+
+        read = broker.invoke("read_file", {"path": "latency.py"}, key="read-required")["result"]
+        broker.invoke("apply_patch", {"changes": [
+            {"path": "latency.py", "expected_hash": read["sha256"], "content": GOOD},
+        ]}, key="required-edit")
+        self.assertEqual(engine.checks.missing_patch_paths(), [])
+        candidate = broker.invoke("run_check", {"check_id": "acceptance", "phase": "candidate"}, key="candidate")["result"]
+        self.assertTrue(candidate["passed"], candidate["output"])
+
+    def test_request_check_failure_category_is_retained_with_output(self):
+        check = CheckSpec(id="comparison", argv=[sys.executable, "-c", "print('byte mismatch'); raise SystemExit(80)"],
+                          failure_categories={80: "content_mismatch"})
+        req = request(self.source).model_copy(update={"checks": [check]})
+        run_id = self.harness.submit(req)
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+
+        result = engine.checks.execute("comparison", "baseline", key="comparison")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failure_category"], "content_mismatch")
+        artifact = json.loads(self.harness.artifact(run_id, result["artifact_id"])["content"])
+        self.assertEqual(artifact["failure_category"], "content_mismatch")
+        self.assertIn("byte mismatch", artifact["output"])
+
+    def test_review_command_cannot_invalidate_source_evidence(self):
+        run_id = self.harness.submit(request(self.source, mode="review"))
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+        broker = engine.broker
+        read = broker.invoke("read_file", {"path": "latency.py"}, key="read")["result"]
+        attempt = broker.invoke("run_command", {
+            "argv": [sys.executable, "-c", "from pathlib import Path; Path('latency.py').write_text('changed')"],
+        }, key="write")["result"]
+        self.assertNotEqual(attempt["exit_code"], 0)
+        self.assertEqual(attempt["source_hash"], attempt["after_source_hash"])
+        self.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
+        evidence = broker.invoke("read_evidence", {"artifact_id": read["evidence_id"]}, key="cite")["result"]
+        self.assertEqual(evidence["sha256"], read["sha256"])
+        self.assertEqual(evidence["evidence_id"], read["evidence_id"])
+        check = broker.invoke("run_check", {"check_id": "acceptance", "phase": "baseline"}, key="check")["result"]
+        self.assertFalse(check["passed"])
+        self.assertIn("TypeError", check["output"])
+        self.assertFalse(check["source_modified"])
 
     def test_invalid_independent_review_blocks_verified_repair(self):
         class SchemaEchoProvider(RepairProvider):

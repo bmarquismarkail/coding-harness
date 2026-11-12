@@ -52,6 +52,11 @@ class ModelServer:
                 answered = any('"user_answer"' in s for s in contents)
                 action = {"type":"finish","summary":"Scoped review completed","findings":[],"gaps":[]}
                 if self.path == "/reviewer/v1/chat/completions":
+                    if data.get("response_format", {}).get("type") == "json_object" and not any(
+                        "json" in content.lower() for content in contents
+                    ):
+                        self.send_error(400, "JSON-object mode requires JSON in the messages")
+                        return
                     action = json.loads(EMPTY_REVIEW_JSON)
                 elif "TASK: question" in "\n".join(contents) and not answered:
                     action = {"type":"input","question":"Which compatibility target should this review use?"}
@@ -159,6 +164,8 @@ class MCPAcceptance(unittest.IsolatedAsyncioTestCase):
             result=await self.call(client,"result",run_id=run_id)
             self.assertEqual(result["outcome"],"unverified")
             self.assertEqual(result["review"], self.harness.result(run_id).review.model_dump())
+            self.assertTrue(any(event["kind"] == "independent_model_review"
+                                for event in self.harness.events(run_id, limit=100)["items"]))
             self.assertNotIn("patch",result)
             artifact=await self.call(client,"artifact",run_id=run_id,artifact_id=result["patch_artifact"],limit=1)
             self.assertEqual(artifact["content"],"")

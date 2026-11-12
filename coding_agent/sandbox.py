@@ -29,7 +29,7 @@ class SandboxRunner:
         self.cancelled = cancelled
         self.protected_files = {}
 
-    def command(self, root: Path, argv: list[str], cwd: str = ".") -> list[str]:
+    def command(self, root: Path, argv: list[str], cwd: str = ".", *, read_only: bool = False) -> list[str]:
         if not argv or any(not isinstance(arg, str) or "\0" in arg for arg in argv):
             raise ValueError("command must be a nonempty argument array")
         relative = Path(cwd)
@@ -55,7 +55,7 @@ class SandboxRunner:
                 if Path(path).exists():
                     command.extend(["--ro-bind", path, path])
         command.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-                        "--dir", "/home/sandbox", "--bind", str(root), "/workspace"])
+                        "--dir", "/home/sandbox", "--ro-bind" if read_only else "--bind", str(root), "/workspace"])
         for dependency in sorted(set([sys.prefix, *self.dependencies])):
             p = Path(dependency).resolve()
             if (not p.exists() or Path.home().is_relative_to(p) or p in map(Path,("/tmp","/proc","/dev","/home/sandbox"))
@@ -82,8 +82,9 @@ class SandboxRunner:
         )
         return [*command, sys.executable, "-I", "-c", wrapper, *argv]
 
-    def run(self, root: Path, argv: list[str], *, cwd: str = ".", timeout: float | None = None) -> dict:
-        command = self.command(root, argv, cwd)
+    def run(self, root: Path, argv: list[str], *, cwd: str = ".", timeout: float | None = None,
+            read_only: bool = False) -> dict:
+        command = self.command(root, argv, cwd, read_only=read_only)
         started = time.monotonic()
         timed_out = False
         cancelled = False

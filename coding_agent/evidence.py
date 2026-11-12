@@ -106,11 +106,14 @@ def recover_partial_review(store, run_id, workspace, revision, reason, coverage=
     return review, gaps
 
 
-def reviewer_view(store, bundle, bundle_id, budget=6000):
+def reviewer_view(store, bundle, bundle_id, budget=6000, *, prefer_sources=False):
     view = ReviewerEvidenceView(bundle_id=bundle_id, run_id=bundle.run_id)
     # Keep complete references in the bundle; each projection explicitly records omissions.
-    for category, items in [('checks', bundle.checks), ('defect_probes', bundle.defect_probes),
-                            ('sources', bundle.source_evidence)]:
+    categories = [('checks', bundle.checks), ('defect_probes', bundle.defect_probes),
+                  ('sources', bundle.source_evidence)]
+    if prefer_sources:
+        categories = [categories[2], *categories[:2]]
+    for category, items in categories:
         for item in items:
             projected = {k: v for k, v in item.items() if k not in {'output', 'wrapper'}}
             target = getattr(view, category)
@@ -126,7 +129,7 @@ def reviewer_view(store, bundle, bundle_id, budget=6000):
         view.omitted_manifest_id = store.artifact(bundle.run_id, omitted) if omitted else None
         if len(view.model_dump_json().encode()) <= budget:
             break
-        category = next((c for c in ('sources', 'defect_probes', 'checks') if getattr(view, c)), None)
+        category = next((c for c, _ in reversed(categories) if getattr(view, c)), None)
         if category is None:
             raise ValueError('budget cannot hold evidence view metadata')
         item = getattr(view, category).pop()

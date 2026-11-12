@@ -121,7 +121,7 @@ class EvidenceTests(unittest.TestCase):
                     findings, gaps = self.engine.independent_review('Repair', [], [])
                     provider.invoke.assert_called_once()
                     prompt = provider.invoke.call_args.args[0][0]['content']
-                    schema = json.loads(prompt.split('must match this schema: ', 1)[1])
+                    schema = json.loads(prompt.split('schema: ', 1)[1])
                 self.assertFalse(findings)
                 self.assertEqual(self.finish(gaps).outcome, outcome)
                 self.assertEqual(set(schema.get('required', [])), set(json.loads(EMPTY_REVIEW_JSON)))
