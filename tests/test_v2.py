@@ -18,10 +18,11 @@ from coding_agent.config import AgentConfig, ConfigError
 from coding_agent.checks import Checks
 from coding_agent.engine import Engine
 from coding_agent.model import ModelError
+from coding_agent.replacement import select_replacement
 from coding_agent.sandbox import SandboxRunner, SandboxError
 from coding_agent.store import Store
 from coding_agent.tools import Change, PatchArgs, ReadArgs, EvidenceArgs, ToolBroker, WorkerTask
-from coding_agent.types import Profile, parse_action
+from coding_agent.types import Profile, ReplacementSpec, parse_action
 from coding_agent.workspace import Workspace, digest
 
 EMPTY_REVIEW_JSON = '{"findings":[],"observations":[],"challenges":[],"semantic_concerns":[]}'
@@ -241,6 +242,99 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.outcome, "verified", result.gaps)
         self.assertIn("new file mode", result.patch)
         self.assertEqual(calls, 7)
+
+    def replacement_engine(self):
+        verifier = self.root / "verify.py"
+        verifier.write_text("# Frozen test verifier\n")
+        selector = self.source / "selector.s"
+        selector.write_text("original\n")
+        target = "replacement.c"
+        expected = hashlib.sha256(b"selected\n").hexdigest()
+        argv = [sys.executable, str(verifier)]
+        spec = ReplacementSpec(target_id="test-target", source_path=target, selector_path=selector.name,
+                               original_selector_sha256=digest(selector), selected_selector_sha256=expected,
+                               selector_argv=[*argv, "select"], verifier_path=str(verifier),
+                               verifier_sha256=digest(verifier), compile_check_id="compile")
+        req = TaskRequest(root=str(self.source), task="Replace the target", replacement=spec,
+                          required_patch_paths=[target, selector.name], readonly_dependencies=[str(verifier)],
+                          checks=[CheckSpec(id="compile", argv=[*argv, "compile"], kind="build"),
+                                  CheckSpec(id="matching", argv=[*argv, "match"], requires=["compile"])])
+        run_id = self.harness.submit(req)
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+        (engine.workspace.root / target).write_text("PLACEHOLDER")
+        return engine
+
+    def test_automatic_selection_fails_closed(self):
+        for failure in ("stale", "source", "third_file", "verifier"):
+            with self.subTest(failure=failure):
+                engine = self.replacement_engine()
+                root = engine.workspace.root
+                if failure == "stale":
+                    (root / "selector.s").write_text("stale\n")
+                if failure == "verifier":
+                    Path(engine.request.replacement.verifier_path).write_text("# Drifted verifier\n")
+                before = digest(root / "selector.s")
+
+                def transform(_runner, stage, _argv):
+                    (stage / "selector.s").write_text("selected\n")
+                    if failure == "source":
+                        (stage / "replacement.c").write_text("tampered")
+                    if failure == "third_file":
+                        (stage / "unrelated.txt").write_text("tampered")
+                    return {"exit_code": 0, "timed_out": False, "output_truncated": False, "output": ""}
+
+                with patch.object(SandboxRunner, "run", autospec=True, side_effect=transform) as runner:
+                    result = select_replacement(engine.checks)
+                self.assertIn("error", result)
+                self.assertEqual(runner.call_count, int(failure in {"source", "third_file"}))
+                self.assertEqual(digest(root / "selector.s"), before)
+                self.assertEqual((root / "replacement.c").read_text(), "PLACEHOLDER")
+                self.assertFalse((root / "unrelated.txt").exists())
+                self.assertIn("selector.s", engine.checks.missing_patch_paths())
+
+    def test_automatic_selection_cancelled_before_publication(self):
+        engine = self.replacement_engine()
+
+        def transform(_runner, stage, _argv):
+            (stage / "selector.s").write_text("selected\n")
+            return {"exit_code": 0, "timed_out": False, "output_truncated": False, "output": ""}
+
+        engine.checks.runner.cancelled = lambda: True
+        with patch.object(SandboxRunner, "run", autospec=True, side_effect=transform):
+            with self.assertRaises(InterruptedError):
+                select_replacement(engine.checks)
+        self.assertEqual((engine.workspace.root / "selector.s").read_text(), "original\n")
+        receipt = engine.store.receipt(engine.run_id, "replacement:test-target")
+        self.assertEqual(receipt["state"], "interrupted")
+        self.assertIn("selector.s", engine.checks.missing_patch_paths())
+
+    def test_automatic_selection_resumes_after_publication(self):
+        engine = self.replacement_engine()
+        store = engine.store
+        save = store.save_receipt
+
+        def transform(_runner, stage, _argv):
+            (stage / "selector.s").write_text("selected\n")
+            return {"exit_code": 0, "timed_out": False, "output_truncated": False, "output": ""}
+
+        def interrupt(run_id, key, kind, state, data):
+            if state == "completed":
+                raise InterruptedError("after publication")
+            return save(run_id, key, kind, state, data)
+
+        with patch.object(SandboxRunner, "run", autospec=True, side_effect=transform) as runner:
+            with patch.object(store, "save_receipt", side_effect=interrupt):
+                with self.assertRaises(InterruptedError):
+                    select_replacement(engine.checks)
+            self.assertEqual(store.receipt(engine.run_id, "replacement:test-target")["state"], "prepared")
+            first = select_replacement(engine.checks)
+            (engine.workspace.root / "replacement.c").write_text("corrected")
+            self.assertEqual(select_replacement(engine.checks), first)
+            self.assertEqual(runner.call_count, 1)
+        self.assertEqual(first["c_before"], first["c_after"])
+        self.assertEqual(engine.checks.missing_patch_paths(), [])
 
     def test_required_patch_path_blocks_checks_after_wrong_file_edit(self):
         req = request(self.source, required_patch_paths=["latency.py"])

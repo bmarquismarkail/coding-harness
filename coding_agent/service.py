@@ -1,6 +1,7 @@
 """Shared public job service used by Python, batch CLI, and MCP."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -16,7 +17,7 @@ from .profiles import resolve_profile
 from .project_profiles import load_definitions, resolve_request, skill_metadata
 from .store import Store
 from .types import RunResult, TaskRequest
-from .workspace import checked_path
+from .workspace import checked_path, digest
 
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "needs_input"}
 
@@ -70,12 +71,25 @@ class Harness:
             if not p.exists() or p == Path("/") or p == Path.home():
                 raise ValueError("dependency must be a specific existing path")
         request = request.model_copy(update={"root": str(source), "readonly_dependencies": [str(Path(p).resolve()) for p in request.readonly_dependencies]})
+        verifier = None
+        replacement = request.replacement
+        if replacement:
+            if digest(checked_path(source, replacement.selector_path)) != replacement.original_selector_sha256:
+                raise ValueError("replacement selector SHA-256 does not match the source baseline")
+            path = Path(replacement.verifier_path)
+            if path.resolve() != path or not any(path.is_relative_to(dep) for dep in map(Path, request.readonly_dependencies)):
+                raise ValueError("replacement verifier must be a canonical mounted file")
+            verifier = path.read_bytes()
+            if hashlib.sha256(verifier).hexdigest() != replacement.verifier_sha256:
+                raise ValueError("replacement verifier SHA-256 does not match")
         profile = resolve_profile(request.profile or ("review" if request.mode == "review" else "coding"), self.config, self.profiles)
         frozen_config = asdict(self.config)
         frozen_config["_resolved_skills"] = skills
         frozen_config["_skill_metadata"] = skill_metadata(skills)
         with self.store.queue_lock():
             run_id = self.store.create(request.model_dump(), frozen_config, profile.model_dump())
+            if verifier is not None:
+                self.store.artifact(run_id, verifier)
             for probe in request.defect_probes:
                 definition = probe.model_dump()
                 definition["check_spec"] = next(c.model_dump() for c in request.checks if c.id == probe.check_id)

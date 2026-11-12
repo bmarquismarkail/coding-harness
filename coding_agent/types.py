@@ -1,6 +1,7 @@
 """Public job contracts and strictly validated agent actions."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 from pydantic import Field, model_validator
 from .contracts import Contract
@@ -15,7 +16,7 @@ class CheckSpec(Contract):
     kind: Literal["acceptance", "regression", "build"] = "acceptance"
     timeout_seconds: float = Field(default=600, gt=0)
     requires: list[str] = Field(default_factory=list)
-    failure_categories: dict[int, Literal["missing_required_change", "unexpected_change", "content_mismatch"]] = Field(default_factory=dict)
+    failure_categories: dict[int, Literal["missing_required_change", "unexpected_change", "content_mismatch", "compiler_input_failure"]] = Field(default_factory=dict)
 
 
 class Profile(Contract):
@@ -45,6 +46,18 @@ class Profile(Contract):
     check_after_edit: bool = False
 
 
+class ReplacementSpec(Contract):
+    target_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    source_path: str
+    selector_path: str
+    original_selector_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selected_selector_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selector_argv: list[str] = Field(min_length=2, max_length=100)
+    verifier_path: str
+    verifier_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    compile_check_id: str
+
+
 class TaskRequest(Contract):
     root: str = Field(min_length=1)
     task: str = Field(min_length=1, max_length=40000)
@@ -59,6 +72,8 @@ class TaskRequest(Contract):
     focus_paths: list[str] = Field(default_factory=list, max_length=40)
     required_patch_paths: list[str] = Field(default_factory=list, max_length=40)
 
+    replacement: ReplacementSpec | None = None
+
     @model_validator(mode="after")
     def check_graph(self):
         if self.required_patch_paths and self.mode != "implement":
@@ -68,6 +83,23 @@ class TaskRequest(Contract):
             if check.id in known or not set(check.requires) <= known:
                 raise ValueError("check IDs must be unique and prerequisites must occur earlier")
             known.add(check.id)
+        replacement = self.replacement
+        if replacement:
+            paths = {replacement.source_path, replacement.selector_path}
+            if (self.mode != "implement" or len(paths) != 2 or not paths <= set(self.required_patch_paths)
+                    or any(not path or Path(path).is_absolute() or ".." in Path(path).parts
+                           or Path(path).as_posix() != path for path in paths)):
+                raise ValueError("replacement needs two distinct required workspace paths")
+            verifier = Path(replacement.verifier_path)
+            if (not verifier.is_absolute() or replacement.verifier_path not in replacement.selector_argv
+                    or replacement.original_selector_sha256 == replacement.selected_selector_sha256
+                    or not any(verifier.is_relative_to(Path(dep)) for dep in self.readonly_dependencies)):
+                raise ValueError("replacement needs a distinct selector splice and a mounted verifier")
+            checks = self.checks or []
+            if (not checks or checks[0].id != replacement.compile_check_id or checks[0].kind != "build"
+                    or checks[0].requires or any(replacement.verifier_path not in c.argv for c in checks)
+                    or any(replacement.compile_check_id not in c.requires for c in checks[1:])):
+                raise ValueError("replacement needs a first build check and dependent verification checks")
         if len({p.check_id for p in self.defect_probes}) != len(self.defect_probes):
             raise ValueError("one trusted probe is permitted per check")
         if len({p.defect_id for p in self.defect_probes}) != len(self.defect_probes):

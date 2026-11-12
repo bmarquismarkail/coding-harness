@@ -21,6 +21,7 @@ from .config import AgentConfig
 from .profiles import configured_models
 from .project_profiles import skill_context, skill_metadata
 from .runtime_model import RecordingProvider, RecoverableResponseError
+from .replacement import select_replacement
 from .sandbox import SandboxError, SandboxRunner
 from .store import Store
 from .tools import EditRejected, EvidenceArgs, ListArgs, ReadArgs, ToolBroker, WorkerTask
@@ -253,7 +254,7 @@ class SpecialistPool:
         task = WorkerTask.model_validate(data["task"])
         broker = ToolBroker(e.store, e.run_id, e.workspace, e.checks, scope=task.paths, mode=e.request.mode, zvec=e.zvec)
         if not data["messages"]:
-            seed = e.seed(broker, task.paths, limit=3000)
+            seed = e.seed(broker, task.paths, limit=3000, compact_checks=True)
             system = instructions(broker, specialist=True, skills=e.skills)
             if task.id.startswith(("final-review-", "repair-advice-")):
                 system = (
@@ -396,12 +397,16 @@ class Engine:
         if self.store.status(self.run_id).active_seconds >= self.profile.max_active_seconds:
             raise RuntimeError("run active-time budget exhausted")
 
-    def seed(self, broker, scopes=None, limit=5000):
+    def seed(self, broker, scopes=None, limit=5000, *, compact_checks=False):
         files = broker.list_files(ListArgs(limit=60))["files"]
         baseline = [{k:r["data"].get(k) for k in ("check_id", "phase", "passed", "exit_code", "artifact_id")}
                     for r in self.store.receipts(self.run_id, "check") if r["state"] == "completed"]
         checks = self.checks.definitions()
-        chunks = [json.dumps({"files": files, "checks": [c["spec"] for c in checks[:8]],
+        specs = [c["spec"] for c in checks[:8]]
+        if compact_checks:
+            specs = [{k: spec[k] for k in ("id", "kind", "requires")} for spec in specs]
+            files = files[:12]
+        chunks = [json.dumps({"files": files, "checks": specs,
                               "total_checks": len(checks), "executed_checks": baseline[-8:],
                               "more_checks": "Use list_checks to page through the frozen definitions."})]
         candidates = ["AGENTS.md", "README.md", "pyproject.toml", "CMakeLists.txt"]
@@ -431,19 +436,24 @@ class Engine:
             target = checked_path(self.workspace.root, path)
             if target.is_file():
                 unchanged[path] = digest(target)
+        if self.request.replacement:
+            scope_hint = ("Supply the required C source. The harness applies the selector after the C edit. "
+                          "If automatic selection failed, use its retained diagnostic.")
+        else:
+            scope_hint = ("Preserve already-created source byte-for-byte. Correct only the outstanding required paths. "
+                          "For an unchanged selector, use the exact selection command in the frozen task if provided.")
         return {
             "failure_category": "missing_required_change",
             "required_patch_paths_missing": missing_paths,
             "unchanged_required_files": unchanged,
-            "scope_hint": (
-                "Preserve already-created source byte-for-byte. Correct only the outstanding required paths. "
-                "For an unchanged selector, use the exact selection command in the frozen task if provided."
-            ),
+            "scope_hint": scope_hint,
         }
 
     def missing_creation_references(self, missing_paths) -> dict[str, None]:
         refs = {}
         for path in missing_paths:
+            if self.request.replacement and path == self.request.replacement.selector_path:
+                continue
             target = checked_path(self.workspace.root, path)
             if not target.exists() and not target.is_symlink():
                 refs[path] = None
@@ -656,12 +666,34 @@ class Engine:
                     if change.get('expected_hash') is None and change.get('content') is not None:
                         if change['path'] not in self.coverage.intended_paths:
                             self.coverage.intended_paths.append(change['path'])
+                replacement = self.request.replacement
+                if replacement and any(change["path"] == replacement.source_path
+                                       for change in action.args["changes"]):
+                    selection = select_replacement(self.checks)
+                    observation["replacement_selection"] = {k: v for k, v in selection.items() if k != "command"}
+                    if "error" not in selection and not self.checks.missing_patch_paths():
+                        self.store.consume(self.run_id)
+                        readiness = self.checks.execute(replacement.compile_check_id, "candidate",
+                                                        key=f"{key}:compile")
+                        observation["compile_readiness"] = readiness
+                        recovered_investigation = readiness.get("passed", False)
+                        if not recovered_investigation:
+                            observation["next_action"] = (
+                                f"Correct the C source at {replacement.source_path} using the compiler output. "
+                                "Preserve the applied selector. No target-byte comparison ran."
+                                if readiness.get("failure_category") == "compiler_input_failure" else
+                                "Diagnose the tool or infrastructure failure. Preserve the applied selector."
+                            )
                 patch_id = self.store.artifact(self.run_id, self.workspace.patch())
                 missing_patch_paths = self.checks.missing_patch_paths()
                 progressed = not missing_patch_paths and patch_id != ledger.get("patch")
                 if missing_patch_paths:
                     observation.update(self.required_change_feedback(missing_patch_paths))
-                    observation["next_action"] = "Edit the required paths before running candidate checks."
+                    observation["next_action"] = (
+                        "Resolve automatic selection using the recorded error before candidate checks."
+                        if replacement and "error" in observation.get("replacement_selection", {})
+                        else "Edit the required paths before running candidate checks."
+                    )
                     edit_refs = self.missing_creation_references(missing_patch_paths)
                 ledger["patch"] = patch_id
                 if progressed and self.request.mode == "implement" and self.profile.check_after_edit:
@@ -826,12 +858,16 @@ class Engine:
                         "Correct patch scope using the verifier output. Restore unrelated changes or correct the selector. "
                         "Preserve the C implementation byte-for-byte."
                     )
+                elif "compiler_input_failure" in categories:
+                    feedback["finish_rejected"] = (
+                        "Correct the C source using the retained compiler diagnostic. Preserve the applied selector."
+                    )
                 elif "content_mismatch" in categories:
                     feedback["finish_rejected"] = "The compiled target bytes differ. Revise the C using the comparison output."
                 scoped_ids = {item["spec"]["id"] for item in self.checks.definitions()
                               if item["origin"] == "request" and item["spec"].get("failure_categories")}
                 tool_failure = (
-                    not scope_failure and "content_mismatch" not in categories
+                    not scope_failure and not categories & {"content_mismatch", "compiler_input_failure"}
                     and any(check["check_id"] in scoped_ids for check in failed_checks)
                 )
                 if tool_failure:
@@ -885,7 +921,8 @@ class Engine:
                         "and its complete source text in content. Read source or inspect the diff first if needed."
                     )
                 elif self.profile.check_after_edit and not (scope_failure or tool_failure) and not missing_patch_paths and (not patch or failed_checks):
-                    targets = set(self.workspace.changed_paths()) if patch else None
+                    targets = ({self.request.replacement.source_path} if self.request.replacement else
+                               set(self.workspace.changed_paths()) if patch else None)
                     edit_refs = self.current_edit_references(state.get("edit_aliases", {}), targets)
                     if edit_refs:
                         feedback["edit_references"] = edit_refs
