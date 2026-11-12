@@ -152,6 +152,10 @@ class Checks:
             self.store.event(self.run_id, "check_interrupted", {"artifact_id": data["artifact_id"]})
             raise
         altered = manifest(root) != before
+        if definition["origin"] == "request" and not (result["timed_out"] or altered or result["output_truncated"]):
+            category = spec.failure_categories.get(result["exit_code"])
+            if category and result["exit_code"] != 0:
+                result["failure_category"] = category
         result.update(check_id=check_id, phase=phase, source_hash=fingerprint, origin=definition["origin"],
                       passed=(result["exit_code"] in probe["not_observed_exit_codes"] if probe_id else result["exit_code"] == 0) and not result["timed_out"] and not altered and not result["output_truncated"],
                       source_modified=altered, skipped=False, executed_at=time.time())

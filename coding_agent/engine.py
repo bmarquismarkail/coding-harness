@@ -425,6 +425,22 @@ class Engine:
                 break
         return "\n".join(chunks)
 
+    def required_change_feedback(self, missing_paths):
+        unchanged = {}
+        for path in missing_paths:
+            target = checked_path(self.workspace.root, path)
+            if target.is_file():
+                unchanged[path] = digest(target)
+        return {
+            "failure_category": "missing_required_change",
+            "required_patch_paths_missing": missing_paths,
+            "unchanged_required_files": unchanged,
+            "scope_hint": (
+                "Preserve already-created source byte-for-byte. Correct only the outstanding required paths. "
+                "For an unchanged selector, use the exact selection command in the frozen task if provided."
+            ),
+        }
+
     def missing_creation_references(self, missing_paths) -> dict[str, None]:
         refs = {}
         for path in missing_paths:
@@ -631,9 +647,9 @@ class Engine:
                 and str(observation.get("error", "")).startswith("Candidate checks require a patch containing: ")
             )
             if blocked_candidate_check:
+                observation.update(self.required_change_feedback(self.checks.missing_patch_paths()))
                 edit_refs = self.missing_creation_references(self.checks.missing_patch_paths())
-                if edit_refs:
-                    observation.pop("review_hint", None)
+                observation.pop("review_hint", None)
             ledger, progressed = evidence_progress(state.get("progress_ledger", {}), observation, self.coverage.intended_paths)
             if isinstance(action, ToolAction) and action.tool == "apply_patch" and "error" not in observation:
                 for change in action.args.get('changes', []):
@@ -644,7 +660,7 @@ class Engine:
                 missing_patch_paths = self.checks.missing_patch_paths()
                 progressed = not missing_patch_paths and patch_id != ledger.get("patch")
                 if missing_patch_paths:
-                    observation["required_patch_paths_missing"] = missing_patch_paths
+                    observation.update(self.required_change_feedback(missing_patch_paths))
                     observation["next_action"] = "Edit the required paths before running candidate checks."
                     edit_refs = self.missing_creation_references(missing_patch_paths)
                 ledger["patch"] = patch_id
@@ -687,7 +703,7 @@ class Engine:
                 )
             streak = 0 if progressed else state.get("reads_since_edit", 0) + 1
             failures = (state.get("protocol_failures", 0) + 1
-                        if "error" in observation and not (blocked_candidate_check and creation_handoff) else 0)
+                        if "error" in observation and not blocked_candidate_check else 0)
             visible = observation
             result = observation.get("result")
             if self.request.mode == "implement" and isinstance(result, dict) and result.get("kind") == "source":
@@ -801,7 +817,26 @@ class Engine:
                 feedback = {"finish_rejected": reason,
                             "failed_checks": [{k:v for k,v in c.items() if k != "output"} for c in failed_checks[-5:]],
                             "outputs": [c.get("output", "")[-1800:] for c in failed_checks[-3:]]}
-                hint = runtime_repair_hint(failed_checks)
+                if missing_patch_paths:
+                    feedback.update(self.required_change_feedback(missing_patch_paths))
+                categories = {check.get("failure_category") for check in failed_checks}
+                scope_failure = bool(categories & {"missing_required_change", "unexpected_change"})
+                if scope_failure:
+                    feedback["finish_rejected"] = (
+                        "Correct patch scope using the verifier output. Restore unrelated changes or correct the selector. "
+                        "Preserve the C implementation byte-for-byte."
+                    )
+                elif "content_mismatch" in categories:
+                    feedback["finish_rejected"] = "The compiled target bytes differ. Revise the C using the comparison output."
+                scoped_ids = {item["spec"]["id"] for item in self.checks.definitions()
+                              if item["origin"] == "request" and item["spec"].get("failure_categories")}
+                tool_failure = (
+                    not scope_failure and "content_mismatch" not in categories
+                    and any(check["check_id"] in scoped_ids for check in failed_checks)
+                )
+                if tool_failure:
+                    feedback["finish_rejected"] = "Diagnose the compiler, input, or tool failure before attempting a new C implementation."
+                hint = runtime_repair_hint(failed_checks) if not (scope_failure or tool_failure) else None
                 if hint:
                     feedback["runtime_hint"] = hint
                 aliases = dict(state.get("diagnosis_aliases", {}))
@@ -819,7 +854,7 @@ class Engine:
                             "diagnosis": action.diagnosis or "Explain the source defect in one sentence.",
                             "diagnosis_sources": list(refs), "findings": [], "gaps": [],
                         }
-                if failed_checks and not hint and self.profile.max_specialists and self.coverage.intended_paths:
+                if failed_checks and not (scope_failure or tool_failure) and not hint and self.profile.max_specialists and self.coverage.intended_paths:
                     advice = WorkerTask(
                         id=f"repair-advice-{self.revision}-{attempts}",
                         paths=self.coverage.intended_paths[:8],
@@ -849,7 +884,7 @@ class Engine:
                         " Create a listed missing file with apply_patch using expected_hash: null "
                         "and its complete source text in content. Read source or inspect the diff first if needed."
                     )
-                elif self.profile.check_after_edit and (not patch or failed_checks):
+                elif self.profile.check_after_edit and not (scope_failure or tool_failure) and not missing_patch_paths and (not patch or failed_checks):
                     targets = set(self.workspace.changed_paths()) if patch else None
                     edit_refs = self.current_edit_references(state.get("edit_aliases", {}), targets)
                     if edit_refs:

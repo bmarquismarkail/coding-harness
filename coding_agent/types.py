@@ -15,6 +15,7 @@ class CheckSpec(Contract):
     kind: Literal["acceptance", "regression", "build"] = "acceptance"
     timeout_seconds: float = Field(default=600, gt=0)
     requires: list[str] = Field(default_factory=list)
+    failure_categories: dict[int, Literal["missing_required_change", "unexpected_change", "content_mismatch"]] = Field(default_factory=dict)
 
 
 class Profile(Contract):

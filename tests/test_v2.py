@@ -268,6 +268,22 @@ class RuntimeTests(unittest.TestCase):
         candidate = broker.invoke("run_check", {"check_id": "acceptance", "phase": "candidate"}, key="candidate")["result"]
         self.assertTrue(candidate["passed"], candidate["output"])
 
+    def test_request_check_failure_category_is_retained_with_output(self):
+        check = CheckSpec(id="comparison", argv=[sys.executable, "-c", "print('byte mismatch'); raise SystemExit(80)"],
+                          failure_categories={80: "content_mismatch"})
+        req = request(self.source).model_copy(update={"checks": [check]})
+        run_id = self.harness.submit(req)
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+
+        result = engine.checks.execute("comparison", "baseline", key="comparison")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failure_category"], "content_mismatch")
+        artifact = json.loads(self.harness.artifact(run_id, result["artifact_id"])["content"])
+        self.assertEqual(artifact["failure_category"], "content_mismatch")
+        self.assertIn("byte mismatch", artifact["output"])
+
     def test_review_command_cannot_invalidate_source_evidence(self):
         run_id = self.harness.submit(request(self.source, mode="review"))
         engine = Engine(self.harness.store, run_id, RepairProvider())
