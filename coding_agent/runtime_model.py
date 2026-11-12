@@ -21,21 +21,22 @@ class RecordingProvider:
     def __init__(self, config, store, run_id, cancelled):
         self.config, self.store, self.run_id, self.cancelled = config, store, run_id, cancelled
 
-    def invoke(self, messages, *, role):
+    def invoke(self, messages, *, role, schema=None):
         self.store.consume(self.run_id, kind="model")
         settings = {"main": self.config.main, "subagent": self.config.subagents,
                     "reviewer": self.config.reviewer}.get(role)
         if settings is None:
             raise ModelError(f"unknown model role: {role}")
+        response_format = self.response_format(role) if schema is None else {"type": "json_object", "schema": schema}
         request = {"role": role, "model": settings.model, "base_url": settings.base_url,
                    "max_tokens": settings.max_tokens, "enable_thinking": settings.enable_thinking,
-                   "messages": messages, "response_format": self.response_format(role)}
+                   "messages": messages, "response_format": response_format}
         artifact = self.store.artifact(self.run_id, request)
         self.store.event(self.run_id, "model_started", {"role": role, "request_artifact": artifact})
         started = time.monotonic()
         result_id = None
         try:
-            body = asyncio.run(self._request(settings, messages, role))
+            body = asyncio.run(self._request(settings, messages, role, response_format))
             record = {"request_artifact": artifact, "response": body, "http_status": 200,
                       "elapsed_seconds": round(time.monotonic()-started, 3)}
             result_id = self.store.artifact(self.run_id, record)
@@ -70,7 +71,7 @@ class RecordingProvider:
                 raise RecoverableResponseError(exc.category, message) from None
             raise ModelError(message) from None
 
-    async def _request(self, settings, messages, role="main"):
+    async def _request(self, settings, messages, role, response_format):
         headers = {}
         if settings.api_key_env:
             key = os.environ.get(settings.api_key_env)
@@ -78,7 +79,10 @@ class RecordingProvider:
                 raise ModelError(f"required credential environment variable {settings.api_key_env} is missing")
             headers["Authorization"] = f"Bearer {key}"
         payload = {"model": settings.model, "messages": messages, "temperature": settings.temperature,
-                   "max_tokens": settings.max_tokens, "response_format": self.response_format(role)}
+                   "max_tokens": settings.max_tokens, "response_format": response_format}
+        if role == "reviewer" and settings.model == "gpt-6-luna":
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
+            del payload["temperature"]
         if role != "reviewer" and settings.reasoning_effort is not None:
             payload["reasoning_effort"] = settings.reasoning_effort
         if role != "reviewer" and settings.enable_thinking is not None:
@@ -109,6 +113,10 @@ class RecordingProvider:
         value = {"type": "json_object"}
         # llama-server accepts the extended schema form; OpenAI's compatible
         # endpoint currently accepts JSON-object mode but rejects schema here.
-        if role != "reviewer" and self.store.get(self.run_id)["profile"].get("constrain_actions", True):
-            value["schema"] = action_schema()
+        if role != "reviewer":
+            run = self.store.get(self.run_id)
+            if run["profile"].get("constrain_actions", True):
+                value["schema"] = action_schema(
+                    typed_findings=role == "main" and run["request"].get("mode") == "review"
+                )
         return value

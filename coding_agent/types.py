@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import Field, model_validator
 from .contracts import Contract
-from .review_types import DefectProbeSpec, ReviewDetails, ReviewerResponse
+from .review_types import FindingProposal, DefectProbeSpec, ReviewDetails, ReviewerResponse
 
 
 
@@ -40,6 +40,8 @@ class Profile(Contract):
     allow_network: bool = False
     allow_install: bool = False
     constrain_actions: bool = True
+    preserve_model_settings: bool = False
+    check_after_edit: bool = False
 
 
 class TaskRequest(Contract):
@@ -131,6 +133,10 @@ class FinishAction(Contract):
     diagnosis_sources: list[str] = Field(default_factory=list, max_length=50)
 
 
+class ReviewFinishAction(FinishAction):
+    findings: list[FindingProposal] = Field(default_factory=list, max_length=30)
+
+
 class InputAction(Contract):
     type: Literal["input"]
     question: str = Field(min_length=1, max_length=2000)
@@ -147,6 +153,7 @@ def parse_action(raw: str) -> ToolAction | FinishAction | InputAction:
     return cls.model_validate(value)
 
 
-def action_schema():
+def action_schema(*, typed_findings=False):
     from pydantic import TypeAdapter
-    return TypeAdapter(ToolAction | FinishAction | InputAction).json_schema()
+    finish = ReviewFinishAction if typed_findings else FinishAction
+    return TypeAdapter(ToolAction | finish | InputAction).json_schema()

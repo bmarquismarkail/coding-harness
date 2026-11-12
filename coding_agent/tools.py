@@ -132,6 +132,8 @@ class ToolBroker:
             "collect": "Wait for named specialists and collect their reports. A required worker failure can be resumed without repeating completed workers.",
             "read_evidence": "Recover previously issued evidence only if its source hash is still valid.",
         }
+        if self.mode == "review" or self.checks.runner.profile.check_after_edit:
+            descriptions["run_command"] = "Run a command with a read-only workspace and writable /tmp. Use run_check for registered checks."
         return {name: {"description": descriptions.get(name, name.replace("_", " ")),
                        "parameters": cls.model_json_schema()} for name, cls in allowed.items()}
 
@@ -180,6 +182,8 @@ class ToolBroker:
 
     def read_file(self, args: ReadArgs, *, record_read=True, **_):
         path = self._path(args.path, args.baseline)
+        if path.is_dir():
+            raise ValueError(f"{args.path} is a directory; use list_files to find a file to read")
         if path.stat().st_size > 1024*1024:
             raise ValueError("file exceeds the text-read limit")
         raw = path.read_bytes()
@@ -245,6 +249,7 @@ class ToolBroker:
             if record.get("baseline", False) or digest(baseline) != record["sha256"]:
                 raise ValueError("source evidence is stale; read the current file again")
             record["validated_against"] = "baseline"
+        record.setdefault("evidence_id", args.artifact_id)
         return record
 
     def read_artifact(self, args: ArtifactArgs, **_):
@@ -338,6 +343,8 @@ class ToolBroker:
             path = self._path(change.path)
             if any(p.is_symlink() for p in [path, *path.parents] if p.is_relative_to(self.workspace.root)):
                 raise ValueError("editing through symlinks is forbidden")
+            if path.is_dir():
+                raise ValueError(f"{change.path} is a directory; apply_patch requires a file path")
             current = digest(path)
             after = hashlib.sha256(change.content.encode()).hexdigest() if change.content is not None else None
             if receipt and current == after:
@@ -379,7 +386,10 @@ class ToolBroker:
         before = tree_hash(self.workspace.root)
         self.store.save_receipt(self.run_id, key, "command", "started", {"argv": args.argv, "cwd":args.cwd, "source_hash":before})
         try:
-            result = self.checks.runner.run(self.workspace.root, args.argv, cwd=args.cwd, timeout=args.timeout_seconds)
+            result = self.checks.runner.run(
+                self.workspace.root, args.argv, cwd=args.cwd, timeout=args.timeout_seconds,
+                read_only=self.mode == "review" or self.checks.runner.profile.check_after_edit,
+            )
         except CommandCancelled as exc:
             data = {**exc.result, "source_hash": before, "verified": False}
             data["artifact_id"] = self.store.artifact(self.run_id, data)

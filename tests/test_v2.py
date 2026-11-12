@@ -117,6 +117,74 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.evidence.patch_source_hash,
                          next(c["source_hash"] for c in result.checks if c.get("phase") == "candidate" and c.get("check_id") == "acceptance"))
 
+    def test_repair_recovers_from_empty_finish_and_rejected_edits(self):
+        self.harness.profiles["post-edit"] = {"check_after_edit": True}
+        run_id = self.harness.submit(request(self.source, profile="post-edit"))
+        test = self
+
+        class RecoveringProvider(RepairProvider):
+            def invoke(self, messages, *, role):
+                if role != "main":
+                    return super().invoke(messages, role=role)
+                self.main_calls += 1
+                step = self.main_calls
+                if step == 1:
+                    return json.dumps({"type": "finish", "summary": "Premature repair claim"})
+                if step == 2:
+                    test.assertIn("No edit landed", messages[-1]["content"])
+                    return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": "latency.py"}})
+                if step == 3:
+                    self.citation = cited_source(messages)
+                    self.edit = {"path": "latency.py", "expected_hash": "0" * 64, "content": GOOD}
+                    return json.dumps({"type": "tool", "tool": "apply_patch", "args": self.edit})
+                if step == 4:
+                    test.assertIn("Use args.changes", messages[-1]["content"])
+                    test.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
+                    return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [self.edit]}})
+                if step == 5:
+                    test.assertIn("Reread the target", messages[-1]["content"])
+                    test.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
+                    return json.dumps({"type": "tool", "tool": "read_file", "args": {"path": "latency.py"}})
+                if step == 6:
+                    self.edit["expected_hash"] = json.loads(messages[-1]["content"])["edit_reference"]["expected_hash"]
+                    return json.dumps({"type": "tool", "tool": "apply_patch", "args": {"changes": [self.edit]}})
+                observation = json.loads(messages[-1]["content"])
+                checks = observation["candidate_checks"]
+                test.assertTrue(checks)
+                test.assertTrue(all(check["passed"] for check in checks))
+                return json.dumps({"type": "finish", "summary": "Fixed generator averaging",
+                                   "diagnosis": "Generators have no length.",
+                                   "diagnosis_sources": observation["finish_template"]["diagnosis_sources"]})
+
+        provider = RecoveringProvider()
+        engine = Engine(self.harness.store, run_id, provider)
+        engine.execute()
+        result = self.harness.result(run_id)
+        self.assertEqual(result.outcome, "verified", result.gaps)
+        self.assertTrue(result.patch)
+        self.assertGreater(provider.worker_calls, 0)
+
+    def test_review_command_cannot_invalidate_source_evidence(self):
+        run_id = self.harness.submit(request(self.source, mode="review"))
+        engine = Engine(self.harness.store, run_id, RepairProvider())
+        engine.workspace.prepare(self.source)
+        engine.checks.initialize(engine.request)
+        broker = engine.broker
+        read = broker.invoke("read_file", {"path": "latency.py"}, key="read")["result"]
+        attempt = broker.invoke("run_command", {
+            "argv": [sys.executable, "-c", "from pathlib import Path; Path('latency.py').write_text('changed')"],
+        }, key="write")["result"]
+        self.assertNotEqual(attempt["exit_code"], 0)
+        self.assertEqual(attempt["source_hash"], attempt["after_source_hash"])
+        self.assertEqual((engine.workspace.root / "latency.py").read_text(), BAD)
+        evidence = broker.invoke("read_evidence", {"artifact_id": read["evidence_id"]}, key="cite")["result"]
+        self.assertEqual(evidence["sha256"], read["sha256"])
+        self.assertEqual(evidence["evidence_id"], read["evidence_id"])
+        check = broker.invoke("run_check", {"check_id": "acceptance", "phase": "baseline"}, key="check")["result"]
+        self.assertFalse(check["passed"])
+        self.assertIn("TypeError", check["output"])
+        self.assertFalse(check["source_modified"])
+
     def test_invalid_independent_review_blocks_verified_repair(self):
         class SchemaEchoProvider(RepairProvider):
             def invoke(self, messages, *, role):

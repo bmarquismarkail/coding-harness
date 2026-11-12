@@ -25,7 +25,7 @@ def resolve_profile(name: str, config: AgentConfig, overrides: dict | None = Non
 
 
 def configured_models(config: AgentConfig, profile: Profile) -> AgentConfig:
-    if profile.name == "legacy":
+    if profile.name == "legacy" or profile.preserve_model_settings:
         return config
     return replace(config,
         main=replace(config.main, max_tokens=profile.main_max_tokens,

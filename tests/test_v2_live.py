@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from coding_agent import Harness
+from coding_agent.campaign import REPAIR_PROFILE
 from coding_agent.sandbox import SandboxRunner
 from coding_agent.types import Profile
 from coding_agent.workspace import copy_source
@@ -19,6 +20,7 @@ from test_v2_acceptance import cpp_fixture
 @unittest.skipUnless(os.environ.get("RUN_V2_LIVE")=="1","set RUN_V2_LIVE=1 for unassisted v0.2 model acceptance")
 class LiveCodingAcceptance(unittest.TestCase):
     def run_case(self,language):
+        self.assertTrue(os.environ.get("HARNESS_LIVE_CONFIG"), "set HARNESS_LIVE_CONFIG to an explicit model config")
         evidence_root=Path(os.environ.get("HARNESS_LIVE_EVIDENCE_DIR",str(Path.home()/".local/state/coding-agent-acceptance")))
         evidence_root.mkdir(parents=True,exist_ok=True)
         folder=Path(tempfile.mkdtemp(prefix=language+"-",dir=evidence_root))
@@ -28,12 +30,16 @@ class LiveCodingAcceptance(unittest.TestCase):
         else:
             req=cpp_fixture(source)
         req=req.model_copy(update={"profile":"live-acceptance"})
-        harness=Harness(folder/"runtime",config_path=Path(__file__).resolve().parents[1]/"agent-config.json",
-                        profiles={"live-acceptance":{"max_actions":200,"max_active_seconds":600}})
+        harness=Harness(folder/"runtime",config_path=Path(os.environ["HARNESS_LIVE_CONFIG"]),
+                        profiles={"live-acceptance": REPAIR_PROFILE})
         run_id=harness.submit(req)
         (folder/"acceptance.json").write_text(json.dumps({"run_id":run_id,"language":language,"state_dir":str(harness.store.root),"status":"running"},indent=2))
         print(f"\nLive {language} evidence: {folder}",flush=True)
-        status=harness.wait(run_id,timeout=620)
+        try:
+            status=harness.wait(run_id,timeout=620)
+        except (TimeoutError, KeyboardInterrupt):
+            harness.cancel(run_id)
+            raise
         result=harness.result(run_id)
         independent=None
         if result and result.outcome=="verified":
@@ -57,7 +63,7 @@ print("independent generator checks passed")
                 independent=runner.run(grade,["./build-independent"]) if build["exit_code"]==0 else build
         with harness.store.db() as db:
             roles={json.loads(r["data"])["role"] for r in db.execute("SELECT data FROM events WHERE run_id=? AND kind='model_completed'",(run_id,))}
-        passed=bool(result and result.outcome=="verified" and independent and independent["exit_code"]==0 and roles=={"main","subagent"})
+        passed=bool(result and result.outcome=="verified" and independent and independent["exit_code"]==0 and {"main","subagent","reviewer"} <= roles and result.review and result.review.completion == "completed")
         report={"run_id":run_id,"language":language,"state_dir":str(harness.store.root),"status":"passed" if passed else "failed",
                 "execution":status.model_dump(),"result":result.model_dump() if result else None,"independent":independent,"roles":sorted(roles)}
         (folder/"acceptance.json").write_text(json.dumps(report,indent=2))
