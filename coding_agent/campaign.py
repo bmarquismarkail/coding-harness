@@ -22,6 +22,10 @@ PROFILE = {"max_actions": 200, "max_active_seconds": 600, "max_model_requests": 
            "preserve_model_settings": True}
 REPAIR_PROFILE = {**PROFILE, "check_after_edit": True}
 ROLES = ("main", "subagent")
+MODEL_OVERRIDES = {
+    "MAIN_BASE_URL", "MAIN_MODEL", "SUBAGENT_BASE_URL", "SUBAGENT_MODEL",
+    "SUBAGENT_PARALLELISM", "REVIEWER_BASE_URL", "REVIEWER_MODEL", "REVIEWER_API_KEY_ENV",
+}
 
 
 def save(path, data):
@@ -86,27 +90,42 @@ def run_protocol(harness, directory):
         run_id = journal["run_id"]
         provider = RecordingProvider(harness.config, harness.store, run_id,
                                      lambda: harness.store.get(run_id)["cancel_requested"])
-        for opportunity in opportunities:
-            attempts = journal["samples"].setdefault(str(opportunity["id"]), [])
-            if attempts and attempts[-1] == "started":
-                attempts[-1] = "interrupted"
-                save(path, journal)
-            while len(attempts) < 3 and "valid" not in attempts:
-                attempts.append("started")
-                save(path, journal)
-                try:
-                    attempts[-1] = protocol_attempt(provider, role, opportunity["requested_action"], attempts[:-1])
-                except (KeyboardInterrupt, InterruptedError):
-                    attempts[-1] = "cancelled"
+        budget = harness.store.get(run_id)["profile"]["max_active_seconds"]
+        exhausted = False
+        finished = False
+        harness.store.transition(run_id, "running")
+        try:
+            for opportunity in opportunities:
+                attempts = journal["samples"].setdefault(str(opportunity["id"]), [])
+                if attempts and attempts[-1] == "started":
+                    attempts[-1] = "interrupted"
                     save(path, journal)
-                    raise
-                save(path, journal)
+                while len(attempts) < 3 and "valid" not in attempts:
+                    if harness.store.status(run_id).active_seconds >= budget:
+                        exhausted = True
+                        break
+                    attempts.append("started")
+                    save(path, journal)
+                    try:
+                        attempts[-1] = protocol_attempt(provider, role, opportunity["requested_action"], attempts[:-1])
+                    except (KeyboardInterrupt, InterruptedError):
+                        attempts[-1] = "cancelled"
+                        save(path, journal)
+                        raise
+                    save(path, journal)
+                if exhausted:
+                    break
+            finished = True
+        finally:
+            harness.store.transition(run_id, "failed" if exhausted else "completed" if finished else "interrupted",
+                                     error="protocol active-time budget exhausted" if exhausted else None)
         samples = list(journal["samples"].values())
-        first = sum(a[0] == "valid" for a in samples)
+        first = sum(bool(a and a[0] == "valid") for a in samples)
         recovered = sum("valid" in a for a in samples)
-        metrics[role] = {"first_response": rate(first, len(samples)),
-                         "after_recovery": rate(recovered, len(samples)),
-                         "passed": first >= 99 and recovered == 100}
+        metrics[role] = {"first_response": rate(first, len(opportunities)),
+                         "after_recovery": rate(recovered, len(opportunities)),
+                         "budget_exhausted": exhausted,
+                         "passed": first >= 99 and recovered == 100 and not exhausted}
     return metrics
 
 
@@ -165,6 +184,9 @@ def run_suite(directory, config_path=None):
     if receipt.exists():
         return load(receipt)["exit_code"] == 0
     env = {k: v for k, v in os.environ.items() if k not in ("RUN_V2_LIVE", "RUN_LIVE_MODEL_TESTS")}
+    if not repair:
+        for name in MODEL_OVERRIDES:
+            env.pop(name, None)
     args = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
     if repair:
         env.update(RUN_V2_LIVE="1", HARNESS_LIVE_CONFIG=str(config_path),

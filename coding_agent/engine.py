@@ -24,7 +24,7 @@ from .runtime_model import RecordingProvider, RecoverableResponseError
 from .sandbox import SandboxError, SandboxRunner
 from .store import Store
 from .tools import EvidenceArgs, ListArgs, ReadArgs, ToolBroker, WorkerTask
-from .types import FinishAction, InputAction, Profile, TaskRequest, ToolAction, parse_action
+from .types import FinishAction, InputAction, Profile, TaskRequest, ToolAction, action_schema, parse_action
 from .workspace import Workspace, checked_path, digest, paths, tree_hash
 from .zvec import ZvecGrepSettings, ZvecGrepTool
 
@@ -259,7 +259,8 @@ class SpecialistPool:
                     'If you have no actionable finding, return {"type":"finish","summary":"Reviewed candidate",'
                     '"review":{"findings":[],"observations":[],"challenges":[],"semantic_concerns":[]}}. '
                     + REVIEW_FINDINGS + FINDING_CITATIONS
-                    + "Available tools: " + json.dumps(broker.schemas(), separators=(",", ":"))
+                    + "\nPROJECT SKILLS (read-only guidance):\n" + skill_context(e.skills)
+                    + "\nAvailable tools: " + json.dumps(broker.schemas(), separators=(",", ":"))
                 )
             data["messages"] = [{"role": "system", "content": system},
                                 {"role": "user", "content": task.task+"\n"+seed}]
@@ -458,9 +459,10 @@ class Engine:
                 bounded = bounded_messages(messages, self.profile.main_context_bytes)
                 refs = state.get("repair_finish_refs", [])
                 if refs and self.profile.constrain_actions and isinstance(self.provider, RecordingProvider):
-                    schema = FinishAction.model_json_schema()
-                    schema["required"].append("diagnosis_sources")
-                    schema["properties"]["diagnosis_sources"] = {
+                    schema = action_schema()
+                    finish = schema["$defs"]["FinishAction"]
+                    finish["required"].append("diagnosis_sources")
+                    finish["properties"]["diagnosis_sources"] = {
                         "type": "array", "minItems": 1, "maxItems": len(refs),
                         "items": {"type": "string", "enum": refs},
                     }
@@ -471,7 +473,8 @@ class Engine:
                         {"type": "object", "additionalProperties": False,
                          "required": ["path", "expected_hash", "content"],
                          "properties": {"path": {"const": path}, "expected_hash": {"const": ref},
-                                        "content": {"type": "string", "maxLength": 200000}}}
+                                        "content": {"anyOf": [{"type": "string", "maxLength": 200000}, {"type": "null"}]},
+                                        "executable": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}}}
                         for path, ref in edit_refs.items()
                     ]
                     schema = {
